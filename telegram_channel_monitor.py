@@ -14,7 +14,7 @@ telegram_channel_monitor.py
 выводит две строки:
 
     {static_id} {emotion_id} {post_link} {rand_views}       <- 2200-2800
-    {static_id} {emotion_id} {post_link} {rand_reactions}   <- 30-50
+    {static_id} {emotion_id} {post_link} {rand_reactions}   <- 30-50, для 365: 70-100
 
 Эмоция определяется по топ-реакции поста (если реакций нет - fallback_id).
 
@@ -360,6 +360,12 @@ def channel_reaction_should_skip(channel_name: str, entity: object) -> bool:
     return channel_name.casefold() in CHANNEL_REACTION_ID_SKIPS
 
 
+def random_reaction_count(emotion_id: int | None) -> int:
+    if emotion_id == 365:
+        return random.randint(70, 100)
+    return random.randint(30, 50)
+
+
 def message_local_date(message: types.Message) -> date | None:
     if not getattr(message, "date", None):
         return None
@@ -393,7 +399,7 @@ def print_post(
         text_preview = f" | {preview}{suffix}"
 
     rand_views = random.randint(2200, 2800)
-    rand_react = random.randint(30, 50)
+    rand_react = random_reaction_count(emotion_id)
 
     sep = "-" * 64
     log(f"{sep}")
@@ -502,7 +508,7 @@ async def amain() -> None:
     log(f"static_id={static_id}  fallback_emotion={args.fallback_id}  poll={args.poll}s")
     log("Output: <id> | <link> | <rand>")
     log("  Views line:     static_id, 2200-2800")
-    log("  Reaction line:  emotion_id, 30-50")
+    log("  Reaction line:  emotion_id, 30-50 (365: 70-100)")
     log()
 
     for name, _ in targets:

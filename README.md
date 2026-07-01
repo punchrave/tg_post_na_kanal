@@ -67,6 +67,24 @@ python .\telegram_autoposter.py --message-file .\message.txt --folder "My folder
 
 On the first run, Telegram will ask for the login code and possibly the 2FA password. After that, the local `.session` file is reused.
 
+## Batch Channel Posts
+
+For a prepared `posts.txt` with blocks like `КАНАЛ 1`, `КАНАЛ 2`, etc., run:
+
+```powershell
+python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run
+python .\telegram_autoposter.py --messages-file .\posts.txt
+```
+
+When a fresh batch of images is provided, copy them to `media_pool` and use a fresh rotation state so the whole new batch can be attached instead of being limited by an old rotation cycle:
+
+```powershell
+python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
+python .\telegram_autoposter.py --messages-file .\posts.txt --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
+```
+
+After posting, copy-friendly lines are written to `reports/copy_YYYYMMDD_HHMMSS.txt`; these are the lines to send back to the user.
+
 ## Report
 
 After posting, the script writes a CSV file:

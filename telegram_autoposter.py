@@ -906,6 +906,26 @@ def custom_emoji_alt(document: types.Document) -> str:
     return "\u2728"
 
 
+def is_custom_emoji_document(document: object) -> bool:
+    if not isinstance(document, types.Document):
+        return False
+    return any(
+        isinstance(attr, types.DocumentAttributeCustomEmoji)
+        for attr in getattr(document, "attributes", [])
+    )
+
+
+def unique_premium_emojis(emojis: Iterable[PremiumEmoji]) -> list[PremiumEmoji]:
+    unique: list[PremiumEmoji] = []
+    seen: set[int] = set()
+    for emoji in emojis:
+        if emoji.document_id in seen:
+            continue
+        seen.add(emoji.document_id)
+        unique.append(emoji)
+    return unique
+
+
 async def premium_emoji_from_document_ids(
     client: TelegramClient,
     document_ids: Sequence[int],
@@ -926,7 +946,7 @@ async def premium_emoji_from_document_ids(
     return [
         PremiumEmoji(document_id=document.id, alt=custom_emoji_alt(document))
         for document in documents
-        if isinstance(document, types.Document)
+        if is_custom_emoji_document(document)
     ]
 
 
@@ -948,8 +968,57 @@ async def premium_emojis_from_pack(
     return [
         PremiumEmoji(document_id=document.id, alt=custom_emoji_alt(document))
         for document in getattr(response, "documents", [])
-        if isinstance(document, types.Document)
+        if is_custom_emoji_document(document)
     ]
+
+
+def input_sticker_set_from_set(sticker_set: object) -> types.TypeInputStickerSet | None:
+    set_id = getattr(sticker_set, "id", None)
+    access_hash = getattr(sticker_set, "access_hash", None)
+    if isinstance(set_id, int) and isinstance(access_hash, int):
+        return types.InputStickerSetID(id=set_id, access_hash=access_hash)
+
+    short_name = getattr(sticker_set, "short_name", None)
+    if isinstance(short_name, str) and short_name:
+        return types.InputStickerSetShortName(short_name=short_name)
+
+    return None
+
+
+async def premium_emojis_from_account_packs(client: TelegramClient) -> list[PremiumEmoji]:
+    try:
+        response = await client(functions.messages.GetEmojiStickersRequest(hash=0))
+    except RPCError as exc:
+        print(f"Premium emoji account pack lookup failed: {exc}")
+        return []
+
+    sticker_sets = list(getattr(response, "sets", []) or [])
+    random.shuffle(sticker_sets)
+
+    emojis: list[PremiumEmoji] = []
+    for sticker_set in sticker_sets:
+        input_set = input_sticker_set_from_set(sticker_set)
+        if input_set is None:
+            continue
+        try:
+            full_set = await client(
+                functions.messages.GetStickerSetRequest(
+                    stickerset=input_set,
+                    hash=0,
+                )
+            )
+        except RPCError as exc:
+            short_name = getattr(sticker_set, "short_name", "unknown")
+            print(f"Premium emoji pack lookup failed for {short_name}: {exc}")
+            continue
+
+        emojis.extend(
+            PremiumEmoji(document_id=document.id, alt=custom_emoji_alt(document))
+            for document in getattr(full_set, "documents", [])
+            if is_custom_emoji_document(document)
+        )
+
+    return unique_premium_emojis(emojis)
 
 
 async def load_premium_emojis(client: TelegramClient) -> list[PremiumEmoji]:
@@ -962,19 +1031,17 @@ async def load_premium_emojis(client: TelegramClient) -> list[PremiumEmoji]:
         for item in os.getenv("TG_PREMIUM_EMOJI_PACKS", "").split(",")
         if item.strip()
     ]
-    pack_emojis: list[PremiumEmoji] = []
-    seen_pack_ids: set[int] = set()
+    pack_emojis = await premium_emojis_from_account_packs(client)
     for pack_name in pack_names:
         for emoji in await premium_emojis_from_pack(client, pack_name):
-            if emoji.document_id in seen_pack_ids:
-                continue
-            seen_pack_ids.add(emoji.document_id)
             pack_emojis.append(emoji)
+    pack_emojis = unique_premium_emojis(pack_emojis)
     if pack_emojis:
         return pack_emojis
 
     seen: set[int] = set()
     document_ids: list[int] = []
+    search_limit = int(os.getenv("TG_PREMIUM_EMOJI_SEARCH_LIMIT", "400"))
     seeds = [
         item.strip()
         for item in os.getenv("TG_PREMIUM_EMOJI_SEEDS", "").split(",")
@@ -996,9 +1063,9 @@ async def load_premium_emojis(client: TelegramClient) -> list[PremiumEmoji]:
                 continue
             seen.add(document_id)
             document_ids.append(document_id)
-            if len(document_ids) >= 40:
+            if len(document_ids) >= search_limit:
                 break
-        if len(document_ids) >= 40:
+        if len(document_ids) >= search_limit:
             break
 
     return await premium_emoji_from_document_ids(client, document_ids)
@@ -1070,7 +1137,7 @@ def premium_accent_plans(
 
     random.shuffle(candidates)
     return [
-        (index, random.choice(list(premium_emojis)), before, after)
+        (index, random.choice(premium_emojis), before, after)
         for index, before, after in candidates[:count]
     ]
 
@@ -1095,11 +1162,10 @@ async def decorate_with_premium_emojis(
 
     message = message.rstrip()
     custom_entities: list[types.MessageEntityCustomEmoji] = []
-    available_emojis = list(premium_emojis)
 
     plans = premium_accent_plans(
         message,
-        available_emojis,
+        premium_emojis,
         min_count,
         max_count,
     )
@@ -1151,6 +1217,12 @@ def channel_reaction_override_id(target: Target) -> int | None:
 
 def channel_reaction_should_skip(target: Target) -> bool:
     return any(key in CHANNEL_REACTION_ID_SKIPS for key in target_link_keys(target))
+
+
+def random_reaction_count(reaction_id: int | None) -> int:
+    if reaction_id == 365:
+        return random.randint(70, 100)
+    return random.randint(30, 50)
 
 
 async def channel_reaction_id(
@@ -1241,7 +1313,7 @@ async def post_one(
         static_id=static_id,
         reaction_id=reaction_id,
         random_views=random.randint(2200, 2800),
-        random_reactions=random.randint(30, 50),
+        random_reactions=random_reaction_count(reaction_id),
         status="posted",
     )
 
