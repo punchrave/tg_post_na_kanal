@@ -7,7 +7,10 @@ import json
 import os
 import random
 import re
+import ssl
 import sys
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -114,6 +117,8 @@ CHANNEL_REACTION_ID_OVERRIDES = {
     "folsis1337": 328,
     "kryqen": 365,
     "jazzouthill": 365,
+    "w8rkludobudka": 365,
+    "propileros": 346,
 }
 
 CHANNEL_REACTION_ID_SKIPS = {
@@ -144,6 +149,8 @@ class PostResult:
     random_reactions: int | None
     status: str
     error: str = ""
+    icheatbot_views_order: int | None = None
+    icheatbot_reaction_order: int | None = None
 
 
 @dataclass(frozen=True)
@@ -455,6 +462,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("TG_PREMIUM_EMOJI_MAX", "3")),
         help="Maximum random premium emoji placed before each post. Default: 3.",
+    )
+    parser.add_argument(
+        "--no-icheatbot",
+        action="store_true",
+        help="Do not send automatic icheatbot API orders after posting.",
     )
     return parser.parse_args()
 
@@ -1461,6 +1473,84 @@ async def post_one(
     )
 
 
+ICHEATBOT_API_URL = "https://icheatbot.com/api/v2"
+ICHEATBOT_SSL_CTX = ssl.create_default_context()
+ICHEATBOT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Content-Type": "application/x-www-form-urlencoded",
+}
+
+
+def icheatbot_add_order(
+    api_key: str,
+    service_id: int,
+    link: str,
+    quantity: int,
+) -> int | None:
+    """Place an order via icheatbot API. Returns the order ID or None on failure."""
+    payload = urllib.parse.urlencode({
+        "key": api_key,
+        "action": "add",
+        "service": service_id,
+        "link": link,
+        "quantity": quantity,
+    }).encode()
+
+    req = urllib.request.Request(
+        ICHEATBOT_API_URL, data=payload, method="POST",
+    )
+    for header_name, header_value in ICHEATBOT_HEADERS.items():
+        req.add_header(header_name, header_value)
+
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ICHEATBOT_SSL_CTX) as resp:
+            result = json.loads(resp.read())
+    except Exception as exc:
+        print(f"  icheatbot API error: {exc}")
+        return None
+
+    if isinstance(result, dict) and "order" in result:
+        return int(result["order"])
+
+    error = result.get("error", result) if isinstance(result, dict) else result
+    print(f"  icheatbot order rejected: {error}")
+    return None
+
+
+def icheatbot_place_orders(
+    api_key: str,
+    result: PostResult,
+) -> None:
+    """Place icheatbot orders for views and reactions on a successfully posted message."""
+    if not api_key or result.status != "posted" or not result.link:
+        return
+
+    # Order views
+    if result.static_id is not None and result.random_views is not None:
+        order_id = icheatbot_add_order(
+            api_key, result.static_id, result.link, result.random_views,
+        )
+        result.icheatbot_views_order = order_id
+        if order_id:
+            print(
+                f"  icheatbot views: order #{order_id} "
+                f"(service={result.static_id}, qty={result.random_views})"
+            )
+
+    # Order reactions
+    if result.reaction_id is not None and result.random_reactions is not None:
+        order_id = icheatbot_add_order(
+            api_key, result.reaction_id, result.link, result.random_reactions,
+        )
+        result.icheatbot_reaction_order = order_id
+        if order_id:
+            print(
+                f"  icheatbot reactions: order #{order_id} "
+                f"(service={result.reaction_id}, qty={result.random_reactions})"
+            )
+
+
 def report_path(value: str | None) -> Path:
     if value:
         return Path(value)
@@ -1493,6 +1583,8 @@ def write_report(path: Path, results: list[PostResult]) -> None:
                 "random_reactions",
                 "status",
                 "error",
+                "icheatbot_views_order",
+                "icheatbot_reaction_order",
             ),
         )
         writer.writeheader()
@@ -1511,6 +1603,14 @@ def write_report(path: Path, results: list[PostResult]) -> None:
                     ),
                     "status": result.status,
                     "error": result.error,
+                    "icheatbot_views_order": (
+                        "" if result.icheatbot_views_order is None
+                        else result.icheatbot_views_order
+                    ),
+                    "icheatbot_reaction_order": (
+                        "" if result.icheatbot_reaction_order is None
+                        else result.icheatbot_reaction_order
+                    ),
                 }
             )
 
@@ -1520,6 +1620,17 @@ def write_copy_lines(path: Path, results: list[PostResult]) -> None:
     for result in results:
         lines.extend(copy_friendly_lines(result))
     path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def append_copy_lines(path: Path, result: PostResult) -> list[str]:
+    lines = copy_friendly_lines(result)
+    if not lines:
+        return []
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as copy_file:
+        copy_file.write("\n".join(lines) + "\n")
+    return lines
 
 
 def copy_friendly_lines(result: PostResult) -> list[str]:
@@ -1665,6 +1776,19 @@ async def amain() -> None:
             else:
                 print("No premium emoji candidates found; posting plain text.")
 
+        output_path = report_path(args.report)
+        copy_output_path = copy_lines_path(output_path)
+        copy_output_path.parent.mkdir(parents=True, exist_ok=True)
+        copy_output_path.write_text("", encoding="utf-8")
+        print(f"Live copy lines file: {copy_output_path.resolve()}")
+
+        icheatbot_api_key = "" if args.no_icheatbot else os.getenv("ICHEATBOT_API_KEY", "")
+        if icheatbot_api_key:
+            print("icheatbot auto-ordering enabled")
+        else:
+            if not args.no_icheatbot:
+                print("icheatbot auto-ordering disabled (no ICHEATBOT_API_KEY in .env)")
+
         results: list[PostResult] = []
         posted_auto_media_keys: list[str] = []
         posted_auto_media_paths: list[Path] = []
@@ -1687,6 +1811,8 @@ async def amain() -> None:
                 )
                 results.append(result)
                 print(f"  posted: {result.link}")
+                if icheatbot_api_key:
+                    icheatbot_place_orders(icheatbot_api_key, result)
                 if result.status == "posted" and post.auto_media_path is not None:
                     posted_auto_media_keys.append(post.rotation_key)
                     posted_auto_media_paths.append(post.auto_media_path)
@@ -1711,6 +1837,8 @@ async def amain() -> None:
                     )
                     results.append(result)
                     print(f"  posted after wait: {result.link}")
+                    if icheatbot_api_key:
+                        icheatbot_place_orders(icheatbot_api_key, result)
                     if result.status == "posted" and post.auto_media_path is not None:
                         posted_auto_media_keys.append(post.rotation_key)
                         posted_auto_media_paths.append(post.auto_media_path)
@@ -1747,15 +1875,20 @@ async def amain() -> None:
                 )
                 print(f"  failed: {exc}")
 
+            if results:
+                live_copy_lines = append_copy_lines(copy_output_path, results[-1])
+                if live_copy_lines:
+                    print("  copy lines:")
+                    for line in live_copy_lines:
+                        print(f"  {line}")
+
             if index < len(prepared_posts):
                 delay = delay_plan[index - 1]
                 if delay > 0:
                     print(f"  waiting before next post: {format_duration(delay)}")
                     await asyncio.sleep(delay)
 
-        output_path = report_path(args.report)
         write_report(output_path, results)
-        copy_output_path = copy_lines_path(output_path)
         write_copy_lines(copy_output_path, results)
         if posted_auto_media_keys:
             mark_auto_media_used(

@@ -21,6 +21,7 @@ Use this workflow when the user sends Telegram channel post blocks and images, o
 - If the user gives an explicit range, use readable durations such as `--delay-min 2m --delay-max 5m` or `--delay-every 2 --delay-min 5m --delay-max 5m`.
 - Avoid hour-scale delays unless the user explicitly asks for them or a server-side Telegram scheduling mode is being used.
 - Mention before the real run how long the delayed batch will take according to the dry-run timing plan.
+- During delayed runs, the autoposter writes copy-friendly lines to the report file immediately after each successful post, so the user does not need to wait for the whole batch to finish.
 
 ## Preparing Posts
 
@@ -50,6 +51,18 @@ python .\telegram_autoposter.py --messages-file .\posts.txt --media-rotation-sta
 ```
 
 - The real posting run archives used images from `media_pool` into `media_used\YYYYMMDD_HHMMSS`. Verify the archive count and that `media_pool` is empty when all provided images were consumed.
+
+## icheatbot Auto-Ordering
+
+- The autoposter automatically places icheatbot.com API orders for views and reactions immediately after each post is published. No manual copy-paste is needed.
+- The API key is stored in `.env` as `ICHEATBOT_API_KEY`. If the key is missing, auto-ordering is silently skipped.
+- For each posted channel, the autoposter sends two API orders:
+  1. **Views**: `service=static_id`, `quantity=random_views` (2200–2800)
+  2. **Reactions**: `service=reaction_id`, `quantity=random_reactions` (30–50 or 70–100 for reaction_id 365)
+- Channels in `CHANNEL_REACTION_ID_SKIPS` get views only (no reaction order).
+- Order IDs are printed inline during posting and saved to the CSV report (`icheatbot_views_order`, `icheatbot_reaction_order` columns).
+- Use `--no-icheatbot` to disable auto-ordering for a specific run.
+- If the API returns an error (e.g., insufficient balance), the error is printed but posting continues normally.
 
 ## Premium Emoji
 
