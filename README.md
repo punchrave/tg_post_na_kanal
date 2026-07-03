@@ -85,6 +85,25 @@ python .\telegram_autoposter.py --messages-file .\posts.txt --media-rotation-sta
 
 After posting, copy-friendly lines are written to `reports/copy_YYYYMMDD_HHMMSS.txt`; these are the lines to send back to the user.
 
+## Delayed Posting
+
+By default, posts are sent with a short random delay of 2-6 seconds between channels.
+For a compact local spread, use a delay profile or explicit min/max durations:
+
+```powershell
+python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run --delay-profile mixed
+python .\telegram_autoposter.py --messages-file .\posts.txt --delay-profile mixed
+```
+
+The `mixed` profile randomly waits around 2-8 minutes between posts. The dry run prints a timing plan before anything is posted.
+
+You can also set a simple random range, or wait only after every N channels:
+
+```powershell
+python .\telegram_autoposter.py --messages-file .\posts.txt --delay-min 10m --delay-max 1h
+python .\telegram_autoposter.py --messages-file .\posts.txt --delay-every 2 --delay-min 5m --delay-max 5m
+```
+
 ## Report
 
 After posting, the script writes a CSV file:

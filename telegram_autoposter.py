@@ -9,7 +9,7 @@ import random
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -46,6 +46,27 @@ CHANNEL_URL_RE = re.compile(
     re.IGNORECASE,
 )
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+DURATION_RE = re.compile(
+    r"(?P<number>\d+(?:\.\d+)?)(?P<unit>s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?",
+    re.IGNORECASE,
+)
+DELAY_PROFILES: dict[str, tuple[tuple[float, float, int], ...]] = {
+    "uniform": (),
+    "quick": (
+        (30, 90, 6),
+        (90, 3 * 60, 4),
+    ),
+    "mixed": (
+        (2 * 60, 4 * 60, 5),
+        (4 * 60, 6 * 60, 4),
+        (6 * 60, 8 * 60, 1),
+    ),
+    "slow": (
+        (5 * 60, 8 * 60, 4),
+        (8 * 60, 12 * 60, 4),
+        (12 * 60, 15 * 60, 2),
+    ),
+}
 
 # ASCII-safe emotion table. When the same emoji is listed more than once,
 # the first ID from the supplied list is used.
@@ -147,6 +168,108 @@ class PreparedPost:
     rotation_key: str
 
 
+def parse_duration(value: str | int | float) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip().lower()
+    if not text:
+        raise argparse.ArgumentTypeError("Duration cannot be empty.")
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return float(text)
+
+    compact = re.sub(r"\s+", "", text)
+    total = 0.0
+    position = 0
+    for match in DURATION_RE.finditer(compact):
+        if match.start() != position:
+            raise argparse.ArgumentTypeError(f"Invalid duration: {value!r}")
+        position = match.end()
+        number = float(match.group("number"))
+        unit = (match.group("unit") or "s").casefold()
+        if unit.startswith("h"):
+            total += number * 60 * 60
+        elif unit.startswith("m"):
+            total += number * 60
+        else:
+            total += number
+
+    if position != len(compact) or total <= 0:
+        raise argparse.ArgumentTypeError(f"Invalid duration: {value!r}")
+    return total
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 60 * 60)
+    minutes, seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def random_delay_for_profile(profile: str, delay_min: float, delay_max: float) -> float:
+    if profile == "uniform":
+        return random.uniform(delay_min, delay_max)
+
+    buckets = DELAY_PROFILES[profile]
+    weights = [bucket[2] for bucket in buckets]
+    start, end, _weight = random.choices(buckets, weights=weights, k=1)[0]
+    return random.uniform(start, end)
+
+
+def build_delay_plan(args: argparse.Namespace, post_count: int) -> list[float]:
+    if post_count <= 1:
+        return []
+
+    delays: list[float] = []
+    for sent_count in range(1, post_count):
+        if sent_count % args.delay_every == 0:
+            delays.append(
+                random_delay_for_profile(args.delay_profile, args.delay_min, args.delay_max)
+            )
+        else:
+            delays.append(0)
+    return delays
+
+
+def should_print_timing_plan(args: argparse.Namespace, delays: Sequence[float]) -> bool:
+    return any(delay > 0 for delay in delays) and (
+        args.delay_every > 1
+        or args.delay_profile != "uniform"
+        or args.delay_min >= 60
+        or args.delay_max >= 60
+    )
+
+
+def print_timing_plan(posts: Sequence[PreparedPost], delays: Sequence[float]) -> None:
+    if not posts:
+        return
+
+    current_time = datetime.now()
+    total_spread = sum(delays)
+    print("\nTiming plan:")
+    print(f"  profile spread: {format_duration(total_spread)} after the first post")
+    for index, post in enumerate(posts):
+        if index > 0:
+            current_time += timedelta(seconds=delays[index - 1])
+            if delays[index - 1] > 0:
+                wait_note = f"after {format_duration(delays[index - 1])}"
+            else:
+                wait_note = "same batch"
+        else:
+            wait_note = "first post"
+        print(
+            f"[{index + 1}/{len(posts)}] "
+            f"{current_time:%Y-%m-%d %H:%M:%S} ({wait_note}) {post.target.title}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Post one Telegram message to every channel in a Telegram folder/filter."
@@ -229,15 +352,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--delay-min",
-        type=float,
-        default=float(os.getenv("TG_DELAY_MIN", "2")),
-        help="Minimum delay between posts in seconds. Default: 2.",
+        type=parse_duration,
+        default=parse_duration(os.getenv("TG_DELAY_MIN", "2")),
+        help="Minimum delay between posts. Accepts seconds, 10m, 1h. Default: 2s.",
     )
     parser.add_argument(
         "--delay-max",
-        type=float,
-        default=float(os.getenv("TG_DELAY_MAX", "6")),
-        help="Maximum delay between posts in seconds. Default: 6.",
+        type=parse_duration,
+        default=parse_duration(os.getenv("TG_DELAY_MAX", "6")),
+        help="Maximum delay between posts. Accepts seconds, 10m, 1h. Default: 6s.",
+    )
+    parser.add_argument(
+        "--delay-profile",
+        choices=tuple(DELAY_PROFILES),
+        default=os.getenv("TG_DELAY_PROFILE", "uniform"),
+        help=(
+            "Delay strategy between posts. "
+            "uniform uses --delay-min/--delay-max; "
+            "quick is mostly 30s-3m; mixed is 2-8m; slow is 5-15m. "
+            "Default: uniform."
+        ),
+    )
+    parser.add_argument(
+        "--delay-every",
+        type=int,
+        default=int(os.getenv("TG_DELAY_EVERY", "1")),
+        help=(
+            "Wait only after every N posted channels. "
+            "Use 2 to send two channels, then wait. Default: 1."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -1413,6 +1556,11 @@ async def amain() -> None:
         raise SystemExit("Delay values must be non-negative.")
     if args.delay_max < args.delay_min:
         raise SystemExit("--delay-max must be greater than or equal to --delay-min.")
+    if args.delay_every < 1:
+        raise SystemExit("--delay-every must be at least 1.")
+    if args.delay_profile not in DELAY_PROFILES:
+        choices = ", ".join(DELAY_PROFILES)
+        raise SystemExit(f"--delay-profile must be one of: {choices}.")
     if args.premium_emoji_min < 0 or args.premium_emoji_max < 0:
         raise SystemExit("Premium emoji counts must be non-negative.")
     if args.premium_emoji_max < args.premium_emoji_min:
@@ -1482,6 +1630,7 @@ async def amain() -> None:
         prepared_posts = [
             post for post in all_prepared_posts if not target_should_skip_post(post.target)
         ]
+        delay_plan = build_delay_plan(args, len(prepared_posts))
 
         print(f"Matched {len(prepared_posts)} target(s):")
         for post in prepared_posts:
@@ -1501,6 +1650,8 @@ async def amain() -> None:
                 post.body,
                 post.media_paths,
             )
+        if should_print_timing_plan(args, delay_plan):
+            print_timing_plan(prepared_posts, delay_plan)
 
         if args.dry_run:
             print("Dry run complete. No messages were posted.")
@@ -1597,8 +1748,10 @@ async def amain() -> None:
                 print(f"  failed: {exc}")
 
             if index < len(prepared_posts):
-                delay = random.uniform(args.delay_min, args.delay_max)
-                await asyncio.sleep(delay)
+                delay = delay_plan[index - 1]
+                if delay > 0:
+                    print(f"  waiting before next post: {format_duration(delay)}")
+                    await asyncio.sleep(delay)
 
         output_path = report_path(args.report)
         write_report(output_path, results)

@@ -8,6 +8,20 @@ Use this workflow when the user sends Telegram channel post blocks and images, o
 - Do not ask for confirmation if the post blocks and images are clear. Run a dry-run check, then send.
 - After sending, always print the copy-friendly output lines in the final answer: `static_id | post_link | views_count` and, when present, `reaction_id | post_link | reactions_count`.
 
+## Selective Posting
+
+- The user may ask to post to all channels except one or more named channels, usernames, links, or channel numbers because those posts will be handled manually.
+- In that case, exclude the specified target(s) from the real send instead of asking for confirmation.
+- Make sure `posts.txt` and the dry-run/real-run target count match the included channels only. In the final answer, mention which channel(s) were skipped.
+
+## Delayed Posting
+
+- If the user asks to send posts at different times, with gaps, spread, delay, or "не в один тайм", use delayed posting.
+- For a local computer, prefer compact schedules that fit the user's available runtime. Good default: `--delay-every 2 --delay-min 5m --delay-max 5m`, which sends two channels, waits five minutes, then continues.
+- If the user gives an explicit range, use readable durations such as `--delay-min 2m --delay-max 5m` or `--delay-every 2 --delay-min 5m --delay-max 5m`.
+- Avoid hour-scale delays unless the user explicitly asks for them or a server-side Telegram scheduling mode is being used.
+- Mention before the real run how long the delayed batch will take according to the dry-run timing plan.
+
 ## Preparing Posts
 
 - Save the pasted channel blocks into `posts.txt` using the script's exact block format:
