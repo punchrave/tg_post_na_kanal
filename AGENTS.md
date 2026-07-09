@@ -16,6 +16,8 @@ Use this workflow when the user sends Telegram channel post blocks and images, o
 
 ## Delayed Posting
 
+- For real Telegram sends, use delayed posting by default even if the user does not explicitly ask for delay. Do not run an immediate real send unless the user explicitly says to send immediately, without delay, or "сразу".
+- The normal default real-send args are `--delay-every 2 --delay-min 5m --delay-max 5m`. Use the same delay args in dry-run so the timing plan is visible before posting.
 - If the user asks to send posts at different times, with gaps, spread, delay, or "не в один тайм", use delayed posting.
 - For a local computer, prefer compact schedules that fit the user's available runtime. Good default: `--delay-every 2 --delay-min 5m --delay-max 5m`, which sends two channels, waits five minutes, then continues.
 - If the user gives an explicit range, use readable durations such as `--delay-min 2m --delay-max 5m` or `--delay-every 2 --delay-min 5m --delay-max 5m`.
