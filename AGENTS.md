@@ -14,6 +14,37 @@ Use this workflow when the user sends Telegram channel post blocks and images, o
 - In that case, exclude the specified target(s) from the real send instead of asking for confirmation.
 - Make sure `posts.txt` and the dry-run/real-run target count match the included channels only. In the final answer, mention which channel(s) were skipped.
 
+## Daily Duplicate Prevention
+
+- When the user asks how many channels have posts today, how many still need posts, or asks a similar preflight question, inspect the full Telegram folder before requesting or preparing post text. Report: total channels, count already posted today, count still empty today, and a numbered folder-order list of the empty channels.
+- Include the names of channels already posted today, with post links and local times when useful, so the user can verify the result. Do not send anything during this inspection.
+- The numbered empty-channel list becomes the input order for the user's next `КАНАЛ N` blocks. Preserve that exact subset and order by generating a matching channels file for the later dry-run and real run; do not remap those blocks against the full folder.
+- Treat the preflight list as advisory because another administrator may post afterward. Keep `--skip-posted-today` enabled during the later real run so any channel that changed after the preflight is safely skipped.
+- When another person may also be posting to some of the channels, add `--skip-posted-today` to both the dry-run and the real run.
+- This mode checks for any Telegram post dated today in the `Europe/Moscow` timezone, regardless of which administrator published it.
+- The autoposter checks once while building the target list and again immediately before each real send. If a post appears during a delayed batch, skip that channel instead of creating a duplicate.
+- Keep every original `КАНАЛ N` block in folder order. Filtering happens after channel-to-block matching, so skipped channels do not shift another channel's text or stream link.
+- A channel skipped by this check must not consume an image and must not receive icheatbot orders. In the final answer, list the channels skipped because they already had a post today.
+- If the user explicitly wants an additional post even though the channel already has one today, omit `--skip-posted-today` for that run.
+
+## Multiple Posts Per Channel
+
+- A channel block may contain `Пост 1`, `Пост 2`, and further posts. Treat bracketed timing such as `[Через 12 минут] Пост 2` as a delay relative to the preceding post in that same channel.
+- Preserve these headers in `posts.txt`; the autoposter parses them directly. For a marked win post, replace the placeholder with `СКРИН ЗАНОСА: media_pool/<copied-file>` so the mapping is explicit and machine-checked.
+- Decide whether a channel is eligible before starting its planned series. If it had no post today at that point, send every explicitly planned follow-up in the series; do not mistake the series' own first post for a pre-existing post and cancel later posts.
+- Recheck the daily-duplicate condition immediately before the first post of each channel series. Once that series starts, follow its stated timing unless the user explicitly changes or cancels it.
+- Keep different channels' sequences independent. A delay inside one channel describes that channel's follow-up timing, not a reason to block unrelated ready posts in other channels.
+- Keep the default `reports/autoposter_owned_posts.json` state file. It records each successful Telegram message ID immediately, allows a delayed series to survive a script restart, and prevents already completed sequence numbers from being sent twice.
+
+## Image Roles and Priority
+
+- The user may classify attached images as ordinary images and win screenshots (`скрины заносов`). Preserve that classification when copying and naming the files: use names such as `YYYYMMDD_ordinary_01.png` and `YYYYMMDD_win_01.png`. Files marked `_win_` are excluded from ordinary random rotation.
+- Text markers such as `[СЮДА КИДАЕМ СКРИНШОТ ЗАНОСА]`, `здесь скрин заноса`, or equivalent wording require a win screenshot on that exact post. This explicit role has priority over normal image rotation.
+- If the user maps a particular image to a post, that mapping has highest priority. Otherwise, assign ordinary images and win screenshots within their own groups in the order the user supplied them.
+- Never put an ordinary image into a win-screenshot placeholder. Never consume a win screenshot for an ordinary-image post while a marked win post still needs one.
+- When there are equal numbers of marked win posts and supplied win screenshots, use each screenshot exactly once. If the counts do not match and the user's intent cannot be determined safely, report the mismatch before a real send.
+- Remove instructional placeholders such as `[СЮДА КИДАЕМ СКРИНШОТ ЗАНОСА]` from the Telegram caption after attaching the selected image.
+
 ## Delayed Posting
 
 - For real Telegram sends, use delayed posting by default even if the user does not explicitly ask for delay. Do not run an immediate real send unless the user explicitly says to send immediately, without delay, or "сразу".
@@ -48,14 +79,15 @@ post text
 - For a new user-provided image batch, use a fresh media rotation state file so old rotation state does not limit the number of attached images:
 
 ```powershell
-python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
-python .\telegram_autoposter.py --messages-file .\posts.txt --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
+python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run --skip-posted-today --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
+python .\telegram_autoposter.py --messages-file .\posts.txt --skip-posted-today --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
 ```
 
 - The real posting run archives used images from `media_pool` into `media_used\YYYYMMDD_HHMMSS`. Verify the archive count and that `media_pool` is empty when all provided images were consumed.
 
 ## icheatbot Auto-Ordering
 
+- Temporarily add `--no-icheatbot` to every dry-run and real posting command. The user has said the icheatbot balance is empty, so do not send any API requests until the user explicitly asks to enable auto-ordering again.
 - The autoposter automatically places icheatbot.com API orders for views and reactions immediately after each post is published. No manual copy-paste is needed.
 - The API key is stored in `.env` as `ICHEATBOT_API_KEY`. If the key is missing, auto-ordering is silently skipped.
 - For each posted channel, the autoposter sends two API orders:

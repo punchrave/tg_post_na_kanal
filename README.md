@@ -104,6 +104,58 @@ python .\telegram_autoposter.py --messages-file .\posts.txt --delay-min 10m --de
 python .\telegram_autoposter.py --messages-file .\posts.txt --delay-every 2 --delay-min 5m --delay-max 5m
 ```
 
+## Skip Channels Already Posted Today
+
+When more than one administrator may publish to the same channels, add
+`--skip-posted-today` to both the dry run and the real run:
+
+```powershell
+python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run --skip-posted-today --delay-every 2 --delay-min 5m --delay-max 5m
+python .\telegram_autoposter.py --messages-file .\posts.txt --skip-posted-today --delay-every 2 --delay-min 5m --delay-max 5m
+```
+
+The check uses `Europe/Moscow` by default. It runs once while preparing the
+batch and again immediately before each send, so a channel is also skipped if
+another administrator posts during a delayed run. Use `--today-timezone` to
+override the timezone.
+
+## Multiple Posts in One Channel
+
+`--messages-file` also accepts a numbered series inside a channel block:
+
+```text
+КАНАЛ 1
+
+Пост 1: запустил. балик на месте, заходите.
+
+https://twitch.tv/yourlink
+
+[Через 12 минут] Пост 2: вау, вот это занесло. скриншот ниже.
+
+СКРИН ЗАНОСА: media_pool/20260710_win_01.png
+```
+
+The delay is relative to the preceding post in the same channel. Other channel
+series remain independent and can be posted while this follow-up is waiting.
+The forms `12 минут`, `1 час 5 минут`, `10m`, and `30s` are supported.
+
+The instruction placeholder `[СЮДА КИДАЕМ СКРИНШОТ ЗАНОСА]` is removed from
+the caption. Before the real run it must be paired with an explicit
+`СКРИН ЗАНОСА: <file>` directive; an ordinary rotation image is never used as
+a replacement for a required win screenshot.
+
+After each successful send, the script immediately stores the batch ID,
+channel, sequence number, Telegram message ID, and send time in
+`reports/autoposter_owned_posts.json`. Follow-ups from that same batch are
+therefore recognized as part of a series instead of being rejected by
+`--skip-posted-today`. Re-running the same daily batch resumes unsent posts and
+does not resend completed sequence numbers. Use `--batch-id` only when a
+manually chosen stable batch identifier is needed.
+
+icheatbot ordering is currently disabled by default. It can only be enabled
+for a run with the explicit `--icheatbot` flag after the account balance is
+available again.
+
 ## Report
 
 After posting, the script writes a CSV file:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import hashlib
 import json
 import os
 import random
@@ -12,9 +13,10 @@ import sys
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from telethon import TelegramClient, functions, types, utils
@@ -42,6 +44,23 @@ MEDIA_DIRECTIVE_RE = re.compile(
     r"^\s*(?:КАРТИНКА|ФОТО|IMAGE|PHOTO|MEDIA)\s*:\s*(.+?)\s*$",
     re.IGNORECASE,
 )
+WIN_MEDIA_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:СКРИН(?:ШОТ)?\s+ЗАНОСА|WIN(?:NER)?(?:_IMAGE|\s+IMAGE)?)\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+WIN_MEDIA_PLACEHOLDER_RE = re.compile(
+    r"^\s*\[\s*(?:СЮДА\s+КИДАЕМ\s+)?СКРИН(?:ШОТ)?\s+ЗАНОСА\s*\]\s*$",
+    re.IGNORECASE,
+)
+CHANNEL_HEADER_RE = re.compile(
+    r"^\s*\*{0,2}\s*(?:КАНАЛ|KANAL|CHANNEL)\s+(\d+)\s*\*{0,2}\s*$",
+    re.IGNORECASE,
+)
+POST_HEADER_RE = re.compile(
+    r"^\s*\*{0,2}\s*(?:\[\s*Через\s+([^\]]+)\s*\]\s*)?"
+    r"Пост\s+(\d+)\s*:\s*\*{0,2}\s*(.*)$",
+    re.IGNORECASE,
+)
 CHANNEL_URL_RE = re.compile(
     r"https?://(?:www\.)?(?P<domain>kick\.com|twitch\.tv)/"
     r"(?P<slug>[A-Za-z0-9_][A-Za-z0-9_.-]*)(?:/)?"
@@ -49,6 +68,7 @@ CHANNEL_URL_RE = re.compile(
     re.IGNORECASE,
 )
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+WIN_MEDIA_NAME_RE = re.compile(r"(?:^|[_\-.])(win|zanos|занос)(?:[_\-.]|$)", re.IGNORECASE)
 DURATION_RE = re.compile(
     r"(?P<number>\d+(?:\.\d+)?)(?P<unit>s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)?",
     re.IGNORECASE,
@@ -163,6 +183,14 @@ class PremiumEmoji:
 class MessagePayload:
     body: str
     media_paths: tuple[Path, ...] = ()
+    media_role: str | None = None
+
+
+@dataclass(frozen=True)
+class SequencedPayload:
+    payload: MessagePayload
+    sequence_index: int
+    delay_after_previous: float = 0
 
 
 @dataclass(frozen=True)
@@ -172,7 +200,17 @@ class PreparedPost:
     original_body: str
     media_paths: tuple[Path, ...]
     auto_media_path: Path | None
+    managed_media_paths: tuple[Path, ...]
     rotation_key: str
+    sequence_index: int
+    sequence_count: int
+    delay_after_previous: float
+
+
+@dataclass(frozen=True)
+class ScheduledPost:
+    post: PreparedPost
+    offset_seconds: float
 
 
 def parse_duration(value: str | int | float) -> float:
@@ -204,6 +242,23 @@ def parse_duration(value: str | int | float) -> float:
     if position != len(compact) or total <= 0:
         raise argparse.ArgumentTypeError(f"Invalid duration: {value!r}")
     return total
+
+
+def parse_relative_duration(value: str) -> float:
+    """Parse human timing used in headers such as '12 минут' or '1 час 5 минут'."""
+    normalized = value.casefold().replace(",", ".").strip()
+    replacements = (
+        (r"\bчас(?:а|ов)?\b|\bч\b", "h"),
+        (r"\bминут(?:а|ы)?\b|\bмин\b|\bм\b", "m"),
+        (r"\bсекунд(?:а|ы)?\b|\bсек\b|\bс\b", "s"),
+    )
+    for pattern, replacement in replacements:
+        normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s+", "", normalized)
+    try:
+        return parse_duration(normalized)
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(f"Invalid relative post delay: {value!r}") from exc
 
 
 def format_duration(seconds: float) -> str:
@@ -245,35 +300,78 @@ def build_delay_plan(args: argparse.Namespace, post_count: int) -> list[float]:
     return delays
 
 
-def should_print_timing_plan(args: argparse.Namespace, delays: Sequence[float]) -> bool:
-    return any(delay > 0 for delay in delays) and (
-        args.delay_every > 1
-        or args.delay_profile != "uniform"
-        or args.delay_min >= 60
-        or args.delay_max >= 60
-    )
+def build_scheduled_posts(
+    args: argparse.Namespace,
+    posts: Sequence[PreparedPost],
+    owned_records: dict[int, dict[int, dict[str, object]]] | None = None,
+) -> list[ScheduledPost]:
+    if not posts:
+        return []
+
+    owned_records = owned_records or {}
+    series: dict[int, list[PreparedPost]] = {}
+    series_order: list[int] = []
+    for post in posts:
+        pid = utils.get_peer_id(post.target.entity)
+        if pid not in series:
+            series[pid] = []
+            series_order.append(pid)
+        series[pid].append(post)
+
+    start_delays = build_delay_plan(args, len(series_order))
+    start_offsets: dict[int, float] = {}
+    current_offset = 0.0
+    for index, pid in enumerate(series_order):
+        if index > 0:
+            current_offset += start_delays[index - 1]
+        start_offsets[pid] = current_offset
+
+    now_utc = datetime.now(timezone.utc)
+    scheduled: list[tuple[float, int, int, ScheduledPost]] = []
+    for order, pid in enumerate(series_order):
+        previous_offset = start_offsets[pid]
+        for post in sorted(series[pid], key=lambda item: item.sequence_index):
+            offset = previous_offset
+            if post.sequence_index > 1:
+                previous_record = owned_records.get(pid, {}).get(post.sequence_index - 1)
+                previous_sent_at = None
+                if previous_record:
+                    raw_sent_at = previous_record.get("sent_at")
+                    if isinstance(raw_sent_at, str):
+                        try:
+                            previous_sent_at = datetime.fromisoformat(raw_sent_at)
+                        except ValueError:
+                            previous_sent_at = None
+                if previous_sent_at is not None:
+                    if previous_sent_at.tzinfo is None:
+                        previous_sent_at = previous_sent_at.replace(tzinfo=timezone.utc)
+                    due_at = previous_sent_at + timedelta(
+                        seconds=post.delay_after_previous
+                    )
+                    offset = max(0.0, (due_at - now_utc).total_seconds())
+                else:
+                    offset = previous_offset + post.delay_after_previous
+            item = ScheduledPost(post=post, offset_seconds=offset)
+            scheduled.append((offset, order, post.sequence_index, item))
+            previous_offset = offset
+
+    return [item for _offset, _order, _sequence, item in sorted(scheduled)]
 
 
-def print_timing_plan(posts: Sequence[PreparedPost], delays: Sequence[float]) -> None:
+def print_scheduled_plan(posts: Sequence[ScheduledPost]) -> None:
     if not posts:
         return
-
-    current_time = datetime.now()
-    total_spread = sum(delays)
+    started_at = datetime.now()
+    total_spread = max(item.offset_seconds for item in posts)
     print("\nTiming plan:")
-    print(f"  profile spread: {format_duration(total_spread)} after the first post")
-    for index, post in enumerate(posts):
-        if index > 0:
-            current_time += timedelta(seconds=delays[index - 1])
-            if delays[index - 1] > 0:
-                wait_note = f"after {format_duration(delays[index - 1])}"
-            else:
-                wait_note = "same batch"
-        else:
-            wait_note = "first post"
+    print(f"  total planned spread: {format_duration(total_spread)}")
+    for index, item in enumerate(posts, start=1):
+        post = item.post
+        planned_at = started_at + timedelta(seconds=item.offset_seconds)
         print(
-            f"[{index + 1}/{len(posts)}] "
-            f"{current_time:%Y-%m-%d %H:%M:%S} ({wait_note}) {post.target.title}"
+            f"[{index}/{len(posts)}] {planned_at:%Y-%m-%d %H:%M:%S} "
+            f"(+{format_duration(item.offset_seconds)}) {post.target.title} "
+            f"post {post.sequence_index}/{post.sequence_count}"
         )
 
 
@@ -415,6 +513,37 @@ def parse_args() -> argparse.Namespace:
         help="Print matched channels without posting.",
     )
     parser.add_argument(
+        "--skip-posted-today",
+        action="store_true",
+        help=(
+            "Skip channels that already have a Telegram post today. "
+            "The channel is checked during planning and again immediately before posting."
+        ),
+    )
+    parser.add_argument(
+        "--today-timezone",
+        default=os.getenv("TG_TODAY_TIMEZONE", "Europe/Moscow"),
+        help=(
+            "Timezone used to decide what counts as today. "
+            "Default: TG_TODAY_TIMEZONE or Europe/Moscow."
+        ),
+    )
+    parser.add_argument(
+        "--owned-posts-state",
+        default=os.getenv("TG_OWNED_POSTS_STATE", "reports/autoposter_owned_posts.json"),
+        help=(
+            "Persistent JSON state used to recognize posts sent by this autoposter "
+            "and resume multi-post series safely."
+        ),
+    )
+    parser.add_argument(
+        "--batch-id",
+        help=(
+            "Optional stable identifier for this posting batch. By default it is "
+            "derived from today's date and the messages file contents."
+        ),
+    )
+    parser.add_argument(
         "--report",
         help="Output CSV report path. Default: reports/posted_YYYYMMDD_HHMMSS.csv.",
     )
@@ -465,8 +594,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-icheatbot",
+        dest="no_icheatbot",
         action="store_true",
-        help="Do not send automatic icheatbot API orders after posting.",
+        default=True,
+        help="Do not send automatic icheatbot API orders (current default).",
+    )
+    parser.add_argument(
+        "--icheatbot",
+        dest="no_icheatbot",
+        action="store_false",
+        help="Explicitly enable automatic icheatbot API orders for this run.",
     )
     return parser.parse_args()
 
@@ -485,15 +622,26 @@ def resolve_media_path(raw_path: str, media_dir: Path) -> Path:
     value = raw_path.strip().strip('"').strip("'")
     path = Path(value)
     if not path.is_absolute():
-        path = media_dir / path
+        workspace_relative = path
+        media_relative = media_dir / path
+        path = workspace_relative if workspace_relative.exists() else media_relative
     return path
 
 
 def payload_from_lines(lines: list[str], media_dir: Path, source_name: str) -> MessagePayload:
     body_lines: list[str] = []
     media_paths: list[Path] = []
+    media_role: str | None = None
 
     for raw_line in lines:
+        win_media_match = WIN_MEDIA_DIRECTIVE_RE.fullmatch(raw_line)
+        if win_media_match:
+            media_path = resolve_media_path(win_media_match.group(1), media_dir)
+            if not media_path.exists():
+                raise SystemExit(f"{source_name}: media file not found: {media_path}")
+            media_paths.append(media_path)
+            media_role = "win"
+            continue
         match = MEDIA_DIRECTIVE_RE.fullmatch(raw_line)
         if match:
             media_path = resolve_media_path(match.group(1), media_dir)
@@ -501,12 +649,19 @@ def payload_from_lines(lines: list[str], media_dir: Path, source_name: str) -> M
                 raise SystemExit(f"{source_name}: media file not found: {media_path}")
             media_paths.append(media_path)
             continue
+        if WIN_MEDIA_PLACEHOLDER_RE.fullmatch(raw_line):
+            media_role = "win"
+            continue
         body_lines.append(raw_line)
 
     body = "\n".join(body_lines).strip()
     if not body:
         raise SystemExit(f"{source_name}: message body is empty.")
-    return MessagePayload(body=body, media_paths=tuple(media_paths))
+    return MessagePayload(
+        body=body,
+        media_paths=tuple(media_paths),
+        media_role=media_role,
+    )
 
 
 def read_message(path: str, media_dir: Path) -> MessagePayload:
@@ -514,13 +669,70 @@ def read_message(path: str, media_dir: Path) -> MessagePayload:
     return payload_from_lines(body, media_dir, path)
 
 
-def read_channel_messages(path: str, media_dir: Path) -> list[MessagePayload]:
+def split_channel_sequence(
+    lines: list[str],
+    media_dir: Path,
+    source_name: str,
+) -> tuple[SequencedPayload, ...]:
+    headers = [index for index, line in enumerate(lines) if POST_HEADER_RE.fullmatch(line)]
+    if not headers:
+        return (
+            SequencedPayload(
+                payload=payload_from_lines(lines, media_dir, source_name),
+                sequence_index=1,
+            ),
+        )
+
+    preamble = lines[: headers[0]]
+    if any(line.strip() for line in preamble):
+        raise SystemExit(
+            f"{source_name}: text before the first 'Пост N:' header is not allowed."
+        )
+
+    sequence: list[SequencedPayload] = []
+    expected_index = 1
+    for header_position, line_index in enumerate(headers):
+        match = POST_HEADER_RE.fullmatch(lines[line_index])
+        if match is None:
+            continue
+        delay_text, raw_index, first_line = match.groups()
+        sequence_index = int(raw_index)
+        if sequence_index != expected_index:
+            raise SystemExit(
+                f"{source_name}: expected Пост {expected_index}, got Пост {sequence_index}."
+            )
+
+        end_index = headers[header_position + 1] if header_position + 1 < len(headers) else len(lines)
+        payload_lines = ([first_line] if first_line else []) + lines[line_index + 1 : end_index]
+        delay = 0.0
+        if sequence_index > 1 and delay_text:
+            delay = parse_relative_duration(delay_text)
+        sequence.append(
+            SequencedPayload(
+                payload=payload_from_lines(
+                    payload_lines,
+                    media_dir,
+                    f"{source_name}: Пост {sequence_index}",
+                ),
+                sequence_index=sequence_index,
+                delay_after_previous=delay,
+            )
+        )
+        expected_index += 1
+
+    return tuple(sequence)
+
+
+def read_channel_messages(
+    path: str,
+    media_dir: Path,
+) -> list[tuple[SequencedPayload, ...]]:
     text = Path(path).read_text(encoding="utf-8-sig")
     blocks: dict[int, list[str]] = {}
     current_index: int | None = None
 
     for raw_line in text.splitlines():
-        match = re.fullmatch(r"\s*(?:КАНАЛ|KANAL|CHANNEL)\s+(\d+)\s*", raw_line, re.IGNORECASE)
+        match = CHANNEL_HEADER_RE.fullmatch(raw_line)
         if match:
             current_index = int(match.group(1))
             blocks.setdefault(current_index, [])
@@ -531,13 +743,11 @@ def read_channel_messages(path: str, media_dir: Path) -> list[MessagePayload]:
     if not blocks:
         raise SystemExit("Messages file must contain blocks like 'КАНАЛ 1'.")
 
-    messages: list[MessagePayload] = []
+    messages: list[tuple[SequencedPayload, ...]] = []
     for index in sorted(blocks):
         messages.append(
-            payload_from_lines(
-                blocks[index],
-                media_dir,
-                f"{path}: КАНАЛ {index}",
+            split_channel_sequence(
+                blocks[index], media_dir, f"{path}: КАНАЛ {index}"
             )
         )
 
@@ -579,7 +789,9 @@ def list_media_pool_files(path: Path) -> list[Path]:
     return sorted(
         item
         for item in path.iterdir()
-        if item.is_file() and item.suffix.casefold() in IMAGE_EXTENSIONS
+        if item.is_file()
+        and item.suffix.casefold() in IMAGE_EXTENSIONS
+        and WIN_MEDIA_NAME_RE.search(item.name) is None
     )
 
 
@@ -788,6 +1000,9 @@ def preview_target(
     original_body: str,
     final_body: str,
     media_paths: Sequence[Path],
+    sequence_index: int = 1,
+    sequence_count: int = 1,
+    delay_after_previous: float = 0,
 ) -> None:
     link_note = "stream link replaced" if original_body != final_body else "no stream link change"
     if has_stream_link(original_body) and original_body == final_body:
@@ -796,7 +1011,12 @@ def preview_target(
     media_note = ", ".join(path.name for path in media_paths) if media_paths else "no image"
     preview = final_body.replace("\n", " ")[:90]
     suffix = "..." if len(final_body) > 90 else ""
-    print(f"[{index}/{total}] {target.title}")
+    sequence_note = ""
+    if sequence_count > 1:
+        sequence_note = f" | post {sequence_index}/{sequence_count}"
+        if delay_after_previous > 0:
+            sequence_note += f" | +{format_duration(delay_after_previous)}"
+    print(f"[{index}/{total}] {target.title}{sequence_note}")
     print(f"  media: {media_note}")
     print(f"  links: {link_note}")
     print(f"  text: {preview}{suffix}")
@@ -805,37 +1025,64 @@ def preview_target(
 def prepare_posts(
     targets: list[Target],
     body: MessagePayload | None,
-    channel_messages: list[MessagePayload],
+    channel_messages: list[tuple[SequencedPayload, ...]],
     channel_links: dict[str, dict[str, str]],
     auto_media_by_channel: dict[str, Path],
+    media_pool_dir: Path | None = None,
 ) -> list[PreparedPost]:
     prepared: list[PreparedPost] = []
     for index, target in enumerate(targets, start=1):
-        current_payload = channel_messages[index - 1] if channel_messages else body
-        if current_payload is None:
+        if channel_messages:
+            sequence = channel_messages[index - 1]
+        elif body is not None:
+            sequence = (SequencedPayload(payload=body, sequence_index=1),)
+        else:
             raise SystemExit("No message body was loaded.")
 
         rotation_key = target_rotation_key(target)
-        auto_media_path = auto_media_by_channel.get(rotation_key)
-        media_paths = current_payload.media_paths
-        if not media_paths and auto_media_path is not None:
-            media_paths = (auto_media_path,)
+        sequence_count = len(sequence)
+        for item in sequence:
+            current_payload = item.payload
+            auto_media_path = None
+            media_paths = current_payload.media_paths
+            if current_payload.media_role == "win" and not media_paths:
+                raise SystemExit(
+                    f"{target.title}: Пост {item.sequence_index} requires a win "
+                    "screenshot. Add 'СКРИН ЗАНОСА: <file>' to that post."
+                )
+            if (
+                item.sequence_index == 1
+                and not media_paths
+                and current_payload.media_role is None
+            ):
+                auto_media_path = auto_media_by_channel.get(rotation_key)
+                if auto_media_path is not None:
+                    media_paths = (auto_media_path,)
 
-        final_body = replace_stream_links(
-            current_payload.body,
-            target,
-            channel_links,
-        )
-        prepared.append(
-            PreparedPost(
-                target=target,
-                body=final_body,
-                original_body=current_payload.body,
-                media_paths=tuple(media_paths),
-                auto_media_path=auto_media_path,
-                rotation_key=rotation_key,
+            final_body = replace_stream_links(
+                current_payload.body,
+                target,
+                channel_links,
             )
-        )
+            prepared.append(
+                PreparedPost(
+                    target=target,
+                    body=final_body,
+                    original_body=current_payload.body,
+                    media_paths=tuple(media_paths),
+                    auto_media_path=auto_media_path,
+                    managed_media_paths=tuple(
+                        media_path
+                        for media_path in media_paths
+                        if media_pool_dir is not None
+                        and media_path.resolve().is_relative_to(media_pool_dir.resolve())
+                    ),
+                    rotation_key=rotation_key,
+                    sequence_index=item.sequence_index,
+                    sequence_count=sequence_count,
+                    delay_after_previous=item.delay_after_previous,
+                )
+            )
 
     return prepared
 
@@ -1004,6 +1251,172 @@ def post_link(entity: object, message_id: int) -> str:
     elif raw.startswith("-"):
         raw = raw[1:]
     return f"https://t.me/c/{raw}/{message_id}"
+
+
+async def latest_post_today(
+    client: TelegramClient,
+    target: Target,
+    timezone: ZoneInfo,
+) -> types.Message | None:
+    """Return the newest real channel post from today, if one exists."""
+    today = datetime.now(timezone).date()
+    async for message in client.iter_messages(target.entity):
+        if not isinstance(message, types.Message):
+            continue
+        message_date = getattr(message, "date", None)
+        if message_date is None:
+            continue
+        local_date = message_date.astimezone(timezone).date()
+        if local_date < today:
+            return None
+        if local_date == today:
+            return message
+    return None
+
+
+async def posts_today_by_target(
+    client: TelegramClient,
+    targets: Sequence[Target],
+    timezone: ZoneInfo,
+) -> dict[int, types.Message]:
+    found: dict[int, types.Message] = {}
+    for target in targets:
+        message = await latest_post_today(client, target, timezone)
+        if message is not None:
+            found[utils.get_peer_id(target.entity)] = message
+    return found
+
+
+def skipped_today_result(target: Target, message: types.Message, reason: str) -> PostResult:
+    return PostResult(
+        channel=target.title,
+        message_id=message.id,
+        link=post_link(target.entity, message.id),
+        views=getattr(message, "views", None),
+        static_id=None,
+        reaction_id=None,
+        random_views=None,
+        random_reactions=None,
+        status="skipped_today",
+        error=reason,
+    )
+
+
+def make_batch_id(args: argparse.Namespace, timezone: ZoneInfo) -> str:
+    if args.batch_id:
+        return args.batch_id.strip()
+    source_path = args.messages_file or args.message_file
+    if not source_path:
+        raise SystemExit("Cannot derive batch ID without a message file.")
+    path = Path(source_path).resolve()
+    digest = hashlib.sha256()
+    digest.update(datetime.now(timezone).date().isoformat().encode("ascii"))
+    digest.update(b"\0")
+    digest.update(str(path).casefold().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    return digest.hexdigest()[:20]
+
+
+def load_owned_posts_state(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {"version": 1, "batches": {}}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise SystemExit(f"Invalid owned-posts state {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise SystemExit(f"Invalid owned-posts state {path}: root must be an object.")
+    if not isinstance(raw.get("batches"), dict):
+        raw["batches"] = {}
+    raw["version"] = 1
+    return raw
+
+
+def batch_channel_records(
+    state: dict[str, object],
+    batch_id: str,
+) -> dict[int, dict[int, dict[str, object]]]:
+    batches = state.get("batches")
+    if not isinstance(batches, dict):
+        return {}
+    batch = batches.get(batch_id)
+    if not isinstance(batch, dict):
+        return {}
+    channels = batch.get("channels")
+    if not isinstance(channels, dict):
+        return {}
+
+    records: dict[int, dict[int, dict[str, object]]] = {}
+    for raw_pid, raw_channel in channels.items():
+        if not isinstance(raw_channel, dict):
+            continue
+        raw_posts = raw_channel.get("posts")
+        if not isinstance(raw_posts, dict):
+            continue
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+        channel_posts: dict[int, dict[str, object]] = {}
+        for raw_index, raw_post in raw_posts.items():
+            if not isinstance(raw_post, dict):
+                continue
+            try:
+                sequence_index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            channel_posts[sequence_index] = raw_post
+        if channel_posts:
+            records[pid] = channel_posts
+    return records
+
+
+def save_owned_post(
+    path: Path,
+    state: dict[str, object],
+    batch_id: str,
+    timezone_name: str,
+    post: PreparedPost,
+    result: PostResult,
+) -> None:
+    if result.status != "posted" or result.message_id is None:
+        return
+    batches = state.setdefault("batches", {})
+    if not isinstance(batches, dict):
+        raise SystemExit("Owned-posts state has an invalid batches value.")
+    batch = batches.setdefault(
+        batch_id,
+        {
+            "created_at": datetime.now().astimezone().isoformat(),
+            "timezone": timezone_name,
+            "channels": {},
+        },
+    )
+    if not isinstance(batch, dict):
+        raise SystemExit(f"Owned-posts batch {batch_id} has an invalid value.")
+    channels = batch.setdefault("channels", {})
+    if not isinstance(channels, dict):
+        raise SystemExit(f"Owned-posts batch {batch_id} has invalid channels.")
+    pid = str(utils.get_peer_id(post.target.entity))
+    channel = channels.setdefault(pid, {"title": post.target.title, "posts": {}})
+    if not isinstance(channel, dict):
+        raise SystemExit(f"Owned-posts channel {pid} has an invalid value.")
+    posts = channel.setdefault("posts", {})
+    if not isinstance(posts, dict):
+        raise SystemExit(f"Owned-posts channel {pid} has invalid posts.")
+    posts[str(post.sequence_index)] = {
+        "message_id": result.message_id,
+        "link": result.link,
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
 
 
 def utf16_len(value: str) -> int:
@@ -1651,6 +2064,10 @@ def copy_friendly_lines(result: PostResult) -> list[str]:
 async def amain() -> None:
     load_dotenv()
     args = parse_args()
+    try:
+        today_timezone = ZoneInfo(args.today_timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise SystemExit(f"Unknown --today-timezone: {args.today_timezone}") from exc
 
     api_id = env_int("TG_API_ID")
     api_hash = os.getenv("TG_API_HASH")
@@ -1685,6 +2102,10 @@ async def amain() -> None:
     channel_messages = (
         read_channel_messages(args.messages_file, media_dir) if args.messages_file else []
     )
+    batch_id = make_batch_id(args, today_timezone)
+    owned_posts_state_path = Path(args.owned_posts_state)
+    owned_posts_state = load_owned_posts_state(owned_posts_state_path)
+    owned_records = batch_channel_records(owned_posts_state, batch_id)
     parse_mode = None if args.parse_mode == "none" else args.parse_mode
 
     client = TelegramClient(args.session, api_id, api_hash)
@@ -1709,25 +2130,77 @@ async def amain() -> None:
         targets = unique_targets(targets)
         if args.limit:
             targets = targets[: args.limit]
+        if not targets:
+            raise SystemExit("No matching channel targets found.")
         skipped_targets = [target for target in targets if target_should_skip_post(target)]
         post_targets = [target for target in targets if not target_should_skip_post(target)]
-
-        if not post_targets:
-            raise SystemExit("No matching channel targets found.")
 
         if channel_messages and len(channel_messages) < len(targets):
             raise SystemExit(
                 f"Messages file has {len(channel_messages)} block(s), "
                 f"but {len(targets)} target(s) were matched."
             )
+
+        posts_today: dict[int, types.Message] = {}
+        skipped_today_targets: list[Target] = []
+        resumed_targets: list[Target] = []
+        if args.skip_posted_today:
+            print(
+                f"Checking {len(post_targets)} channel(s) for posts today "
+                f"({args.today_timezone})..."
+            )
+            posts_today = await posts_today_by_target(
+                client,
+                post_targets,
+                today_timezone,
+            )
+            resumed_targets = [
+                target
+                for target in post_targets
+                if utils.get_peer_id(target.entity) in posts_today
+                and utils.get_peer_id(target.entity) in owned_records
+            ]
+            skipped_today_targets = [
+                target
+                for target in post_targets
+                if utils.get_peer_id(target.entity) in posts_today
+                and utils.get_peer_id(target.entity) not in owned_records
+            ]
+            post_targets = [
+                target
+                for target in post_targets
+                if utils.get_peer_id(target.entity) not in {
+                    utils.get_peer_id(skipped.entity)
+                    for skipped in skipped_today_targets
+                }
+            ]
         channel_links = load_channel_links(Path(args.channel_links), targets)
         media_pool_dir = Path(args.media_pool_dir)
         media_pool_dir.mkdir(parents=True, exist_ok=True)
         media_rotation_state_path = Path(args.media_rotation_state)
         media_rotation_state = load_media_rotation_state(media_rotation_state_path)
-        media_files = [] if args.no_auto_media else list_media_pool_files(media_pool_dir)
+        explicitly_assigned_media = {
+            media_path.resolve()
+            for sequence in channel_messages
+            for item in sequence
+            for media_path in item.payload.media_paths
+        }
+        media_files = (
+            []
+            if args.no_auto_media
+            else [
+                media_path
+                for media_path in list_media_pool_files(media_pool_dir)
+                if media_path.resolve() not in explicitly_assigned_media
+            ]
+        )
+        media_targets = [
+            target
+            for target in post_targets
+            if 1 not in owned_records.get(utils.get_peer_id(target.entity), {})
+        ]
         auto_media_by_channel = auto_media_assignments(
-            post_targets,
+            media_targets,
             media_files,
             media_rotation_state,
         )
@@ -1737,20 +2210,46 @@ async def amain() -> None:
             channel_messages,
             channel_links,
             auto_media_by_channel,
+            media_pool_dir,
         )
+        post_target_ids = {utils.get_peer_id(target.entity) for target in post_targets}
         prepared_posts = [
-            post for post in all_prepared_posts if not target_should_skip_post(post.target)
+            post
+            for post in all_prepared_posts
+            if utils.get_peer_id(post.target.entity) in post_target_ids
+            and post.sequence_index
+            not in owned_records.get(utils.get_peer_id(post.target.entity), {})
         ]
-        delay_plan = build_delay_plan(args, len(prepared_posts))
+        scheduled_posts = build_scheduled_posts(args, prepared_posts, owned_records)
 
-        print(f"Matched {len(prepared_posts)} target(s):")
+        print(f"Batch ID: {batch_id}")
+        print(f"Matched {len(prepared_posts)} pending post(s):")
         for post in prepared_posts:
             target = post.target
-            print(f"- {target.title}")
+            print(
+                f"- {target.title}: post {post.sequence_index}/{post.sequence_count}"
+            )
         if skipped_targets:
             print("\nTemporarily skipped target(s):")
             for target in skipped_targets:
                 print(f"- {target.title}")
+        if skipped_today_targets:
+            print(
+                f"\nSkipped because a post already exists today "
+                f"({args.today_timezone}):"
+            )
+            for target in skipped_today_targets:
+                message = posts_today[utils.get_peer_id(target.entity)]
+                timestamp = message.date.astimezone(today_timezone).strftime("%H:%M:%S")
+                print(
+                    f"- {target.title}: {timestamp} "
+                    f"{post_link(target.entity, message.id)}"
+                )
+        if resumed_targets:
+            print("\nContinuing series previously started by this autoposter:")
+            for target in resumed_targets:
+                completed = sorted(owned_records[utils.get_peer_id(target.entity)])
+                print(f"- {target.title}: completed post(s) {completed}")
         print("\nPreview:")
         for index, post in enumerate(prepared_posts, start=1):
             preview_target(
@@ -1760,16 +2259,19 @@ async def amain() -> None:
                 post.original_body,
                 post.body,
                 post.media_paths,
+                post.sequence_index,
+                post.sequence_count,
+                post.delay_after_previous,
             )
-        if should_print_timing_plan(args, delay_plan):
-            print_timing_plan(prepared_posts, delay_plan)
+        if scheduled_posts:
+            print_scheduled_plan(scheduled_posts)
 
         if args.dry_run:
             print("Dry run complete. No messages were posted.")
             return
 
         premium_emojis: list[PremiumEmoji] = []
-        if not args.no_premium_emoji:
+        if prepared_posts and not args.no_premium_emoji:
             premium_emojis = await load_premium_emojis(client)
             if premium_emojis:
                 print(f"Loaded {len(premium_emojis)} premium emoji candidate(s).")
@@ -1789,12 +2291,153 @@ async def amain() -> None:
             if not args.no_icheatbot:
                 print("icheatbot auto-ordering disabled (no ICHEATBOT_API_KEY in .env)")
 
-        results: list[PostResult] = []
+        results: list[PostResult] = [
+            skipped_today_result(
+                target,
+                posts_today[utils.get_peer_id(target.entity)],
+                f"A post already existed today in {args.today_timezone} during planning.",
+            )
+            for target in skipped_today_targets
+        ]
         posted_auto_media_keys: list[str] = []
         posted_auto_media_paths: list[Path] = []
-        for index, post in enumerate(prepared_posts, start=1):
+        skipped_series_ids: set[int] = set()
+        failed_series_ids: set[int] = set()
+        event_loop = asyncio.get_running_loop()
+        schedule_started_at = event_loop.time()
+
+        def register_success(post: PreparedPost, result: PostResult) -> None:
+            results.append(result)
+            save_owned_post(
+                owned_posts_state_path,
+                owned_posts_state,
+                batch_id,
+                args.today_timezone,
+                post,
+                result,
+            )
+            owned_records.clear()
+            owned_records.update(batch_channel_records(owned_posts_state, batch_id))
+            if icheatbot_api_key:
+                icheatbot_place_orders(icheatbot_api_key, result)
+            if result.status == "posted" and post.auto_media_path is not None:
+                posted_auto_media_keys.append(post.rotation_key)
+            if result.status == "posted" and post.managed_media_paths:
+                posted_auto_media_paths.extend(post.managed_media_paths)
+
+        pending_schedule = list(scheduled_posts)
+        completed_schedule_items = 0
+        while pending_schedule:
+            for scheduled in list(pending_schedule):
+                pid = utils.get_peer_id(scheduled.post.target.entity)
+                if pid not in skipped_series_ids and pid not in failed_series_ids:
+                    continue
+                reason = "skipped" if pid in skipped_series_ids else "failed"
+                print(
+                    f"Skipping {scheduled.post.target.title} post "
+                    f"{scheduled.post.sequence_index}: an earlier post in the "
+                    f"series was {reason}."
+                )
+                pending_schedule.remove(scheduled)
+
+            if not pending_schedule:
+                break
+
+            candidates: list[tuple[float, int, ScheduledPost]] = []
+            now_monotonic = event_loop.time()
+            now_utc = datetime.now(timezone.utc)
+            for order, candidate in enumerate(pending_schedule):
+                candidate_post = candidate.post
+                candidate_pid = utils.get_peer_id(candidate_post.target.entity)
+                if candidate_post.sequence_index == 1:
+                    due_monotonic = schedule_started_at + candidate.offset_seconds
+                else:
+                    previous_record = owned_records.get(candidate_pid, {}).get(
+                        candidate_post.sequence_index - 1
+                    )
+                    if previous_record is None:
+                        continue
+                    raw_sent_at = previous_record.get("sent_at")
+                    if not isinstance(raw_sent_at, str):
+                        continue
+                    try:
+                        previous_sent_at = datetime.fromisoformat(raw_sent_at)
+                    except ValueError:
+                        continue
+                    if previous_sent_at.tzinfo is None:
+                        previous_sent_at = previous_sent_at.replace(tzinfo=timezone.utc)
+                    due_at = previous_sent_at + timedelta(
+                        seconds=candidate_post.delay_after_previous
+                    )
+                    due_monotonic = now_monotonic + max(
+                        0.0,
+                        (due_at - now_utc).total_seconds(),
+                    )
+                candidates.append((due_monotonic, order, candidate))
+
+            if not candidates:
+                for scheduled in pending_schedule:
+                    results.append(
+                        PostResult(
+                            channel=scheduled.post.target.title,
+                            message_id=None,
+                            link="",
+                            views=None,
+                            static_id=None,
+                            reaction_id=None,
+                            random_views=None,
+                            random_reactions=None,
+                            status="failed",
+                            error="Previous post in the series was not recorded.",
+                        )
+                    )
+                print("No remaining series post has a recorded predecessor; stopping.")
+                break
+
+            due_monotonic, _order, scheduled = min(candidates)
+            pending_schedule.remove(scheduled)
+            completed_schedule_items += 1
+            index = completed_schedule_items
+            post = scheduled.post
+            pid = utils.get_peer_id(post.target.entity)
+            remaining = due_monotonic - event_loop.time()
+            if remaining > 0:
+                print(
+                    f"[{index}/{len(scheduled_posts)}] Waiting "
+                    f"{format_duration(remaining)} for {post.target.title} "
+                    f"post {post.sequence_index}/{post.sequence_count}..."
+                )
+                await asyncio.sleep(remaining)
+
+            series_started_by_us = bool(owned_records.get(pid))
+            if args.skip_posted_today and not series_started_by_us:
+                existing_message = await latest_post_today(
+                    client,
+                    post.target,
+                    today_timezone,
+                )
+                if existing_message is not None:
+                    result = skipped_today_result(
+                        post.target,
+                        existing_message,
+                        (
+                            "A post appeared today after planning; skipped during "
+                            "the final pre-send check."
+                        ),
+                    )
+                    results.append(result)
+                    skipped_series_ids.add(pid)
+                    print(
+                        f"[{index}/{len(scheduled_posts)}] Skipping "
+                        f"{post.target.title} series: a post already exists today "
+                        f"({result.link})"
+                    )
+                    continue
             try:
-                print(f"[{index}/{len(prepared_posts)}] Posting to {post.target.title}...")
+                print(
+                    f"[{index}/{len(scheduled_posts)}] Posting to {post.target.title} "
+                    f"(post {post.sequence_index}/{post.sequence_count})..."
+                )
                 result = await post_one(
                     client,
                     post.target,
@@ -1809,13 +2452,8 @@ async def amain() -> None:
                     args.premium_emoji_min,
                     args.premium_emoji_max,
                 )
-                results.append(result)
+                register_success(post, result)
                 print(f"  posted: {result.link}")
-                if icheatbot_api_key:
-                    icheatbot_place_orders(icheatbot_api_key, result)
-                if result.status == "posted" and post.auto_media_path is not None:
-                    posted_auto_media_keys.append(post.rotation_key)
-                    posted_auto_media_paths.append(post.auto_media_path)
             except FloodWaitError as exc:
                 wait_seconds = int(exc.seconds) + 2
                 print(f"  Telegram flood wait: sleeping {wait_seconds}s")
@@ -1835,13 +2473,8 @@ async def amain() -> None:
                         args.premium_emoji_min,
                         args.premium_emoji_max,
                     )
-                    results.append(result)
+                    register_success(post, result)
                     print(f"  posted after wait: {result.link}")
-                    if icheatbot_api_key:
-                        icheatbot_place_orders(icheatbot_api_key, result)
-                    if result.status == "posted" and post.auto_media_path is not None:
-                        posted_auto_media_keys.append(post.rotation_key)
-                        posted_auto_media_paths.append(post.auto_media_path)
                 except Exception as retry_exc:
                     results.append(
                         PostResult(
@@ -1857,6 +2490,7 @@ async def amain() -> None:
                             error=str(retry_exc),
                         )
                     )
+                    failed_series_ids.add(pid)
                     print(f"  failed after wait: {retry_exc}")
             except Exception as exc:
                 results.append(
@@ -1873,6 +2507,7 @@ async def amain() -> None:
                         error=str(exc),
                     )
                 )
+                failed_series_ids.add(pid)
                 print(f"  failed: {exc}")
 
             if results:
@@ -1882,12 +2517,6 @@ async def amain() -> None:
                     for line in live_copy_lines:
                         print(f"  {line}")
 
-            if index < len(prepared_posts):
-                delay = delay_plan[index - 1]
-                if delay > 0:
-                    print(f"  waiting before next post: {format_duration(delay)}")
-                    await asyncio.sleep(delay)
-
         write_report(output_path, results)
         write_copy_lines(copy_output_path, results)
         if posted_auto_media_keys:
@@ -1896,8 +2525,8 @@ async def amain() -> None:
                 media_rotation_state,
                 posted_auto_media_keys,
             )
-            if not args.keep_used_media:
-                archive_used_media(posted_auto_media_paths, Path(args.used_media_dir))
+        if posted_auto_media_paths and not args.keep_used_media:
+            archive_used_media(posted_auto_media_paths, Path(args.used_media_dir))
         print(f"\nCSV report: {output_path.resolve()}")
         print(f"Copy lines file: {copy_output_path.resolve()}")
         print("\nCopy-friendly lines:")
