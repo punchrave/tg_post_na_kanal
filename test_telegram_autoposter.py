@@ -1,3 +1,4 @@
+import random
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -8,8 +9,12 @@ from telethon import types
 from telethon import utils
 
 from telegram_autoposter import (
+    KICK_EMOJI_SLOTS_IDS,
+    KICK_RANDOM_PACK_IDS,
     MessagePayload,
+    PLATFORM_PREMIUM_EMOJI_IDS,
     PostResult,
+    PremiumEmoji,
     PreparedPost,
     SequencedPayload,
     Target,
@@ -17,10 +22,75 @@ from telegram_autoposter import (
     build_scheduled_posts,
     load_owned_posts_state,
     list_media_pool_files,
+    platform_premium_emoji_plans,
+    premium_accent_plans,
     prepare_posts,
     save_owned_post,
     split_channel_sequence,
 )
+
+
+class PlatformPremiumEmojiTests(unittest.TestCase):
+    def platform_emojis(self) -> list[PremiumEmoji]:
+        all_ids = {
+            document_id
+            for document_ids in (
+                *PLATFORM_PREMIUM_EMOJI_IDS.values(),
+                KICK_EMOJI_SLOTS_IDS,
+                KICK_RANDOM_PACK_IDS,
+            )
+            for document_id in document_ids
+        }
+        return [
+            PremiumEmoji(document_id=document_id, alt="x")
+            for document_id in all_ids
+        ]
+
+    def test_twitch_marker_is_always_the_fixed_sequence(self) -> None:
+        plans = platform_premium_emoji_plans(
+            "https://twitch.tv/name",
+            self.platform_emojis(),
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(
+            tuple(emoji.document_id for emoji in plans[0][1]),
+            PLATFORM_PREMIUM_EMOJI_IDS["twitch.tv"],
+        )
+
+    def test_kick_marker_randomizes_only_across_approved_sources(self) -> None:
+        source_types: set[str] = set()
+        random_state = random.getstate()
+        try:
+            for seed in range(100):
+                random.seed(seed)
+                plans = platform_premium_emoji_plans(
+                    "https://kick.com/name",
+                    self.platform_emojis(),
+                )
+                ids = tuple(emoji.document_id for emoji in plans[0][1])
+                if ids == PLATFORM_PREMIUM_EMOJI_IDS["kick.com"]:
+                    source_types.add("wordmark")
+                elif len(ids) == 1 and ids[0] in KICK_EMOJI_SLOTS_IDS:
+                    source_types.add("slots")
+                elif len(ids) == 1 and ids[0] in KICK_RANDOM_PACK_IDS:
+                    source_types.add("pack")
+                else:
+                    self.fail(f"Unexpected Kick marker IDs: {ids}")
+        finally:
+            random.setstate(random_state)
+
+        self.assertEqual(source_types, {"wordmark", "slots", "pack"})
+
+    def test_random_accents_do_not_use_stream_link_position(self) -> None:
+        plans = premium_accent_plans(
+            "https://kick.com/name",
+            [PremiumEmoji(document_id=1, alt="x")],
+            1,
+            3,
+        )
+
+        self.assertEqual(plans, [])
 
 
 class MultiPostParserTests(unittest.TestCase):

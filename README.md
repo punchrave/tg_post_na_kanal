@@ -152,9 +152,8 @@ therefore recognized as part of a series instead of being rejected by
 does not resend completed sequence numbers. Use `--batch-id` only when a
 manually chosen stable batch identifier is needed.
 
-icheatbot ordering is currently disabled by default. It can only be enabled
-for a run with the explicit `--icheatbot` flag after the account balance is
-available again.
+icheatbot ordering is enabled by default when `ICHEATBOT_API_KEY` is present.
+Use `--no-icheatbot` to disable orders for a specific run.
 
 ## Report
 

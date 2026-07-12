@@ -41,6 +41,9 @@ Use this workflow when the user sends Telegram channel post blocks and images, o
 - The user may classify attached images as ordinary images and win screenshots (`скрины заносов`). Preserve that classification when copying and naming the files: use names such as `YYYYMMDD_ordinary_01.png` and `YYYYMMDD_win_01.png`. Files marked `_win_` are excluded from ordinary random rotation.
 - Text markers such as `[СЮДА КИДАЕМ СКРИНШОТ ЗАНОСА]`, `здесь скрин заноса`, or equivalent wording require a win screenshot on that exact post. This explicit role has priority over normal image rotation.
 - If the user maps a particular image to a post, that mapping has highest priority. Otherwise, assign ordinary images and win screenshots within their own groups in the order the user supplied them.
+- Win-screenshot posts must preferentially go to Telegram channels whose effective stream link in `channel_links.json` points to `kick.com`. Before writing `posts.txt`, inspect every block containing a win placeholder and the matched target's effective link. If a win block lands on a Twitch-linked target while an eligible Kick-linked target has a non-win block, swap/reassign the whole post block so the win post goes to the Kick-linked target. Aim for all win posts to use Kick-linked targets whenever enough eligible Kick channels exist, not merely half or a plurality.
+- The pasted `КАНАЛ N` numbering alone is not an explicit image-to-channel instruction and may be remapped to satisfy the Kick priority. Only preserve a non-Kick win assignment when the user explicitly names that Telegram channel/username as the destination, or when there are not enough eligible Kick-linked targets. A separately stated user mapping still has highest priority.
+- In the dry-run preview, explicitly verify and report the effective stream service for every win-screenshot target. Do not start the real send if a win post remains on a Twitch-linked target while an unused eligible Kick-linked target is available.
 - Never put an ordinary image into a win-screenshot placeholder. Never consume a win screenshot for an ordinary-image post while a marked win post still needs one.
 - When there are equal numbers of marked win posts and supplied win screenshots, use each screenshot exactly once. If the counts do not match and the user's intent cannot be determined safely, report the mismatch before a real send.
 - Remove instructional placeholders such as `[СЮДА КИДАЕМ СКРИНШОТ ЗАНОСА]` from the Telegram caption after attaching the selected image.
@@ -87,7 +90,7 @@ python .\telegram_autoposter.py --messages-file .\posts.txt --skip-posted-today 
 
 ## icheatbot Auto-Ordering
 
-- Temporarily add `--no-icheatbot` to every dry-run and real posting command. The user has said the icheatbot balance is empty, so do not send any API requests until the user explicitly asks to enable auto-ordering again.
+- icheatbot auto-ordering is enabled again. Do not add `--no-icheatbot` to normal dry-run or real posting commands unless the user explicitly asks to disable ordering for that run.
 - The autoposter automatically places icheatbot.com API orders for views and reactions immediately after each post is published. No manual copy-paste is needed.
 - The API key is stored in `.env` as `ICHEATBOT_API_KEY`. If the key is missing, auto-ordering is silently skipped.
 - For each posted channel, the autoposter sends two API orders:
@@ -101,6 +104,9 @@ python .\telegram_autoposter.py --messages-file .\posts.txt --skip-posted-today 
 ## Premium Emoji
 
 - Leave premium Telegram emoji enabled unless the user explicitly asks otherwise.
+- Every `twitch.tv` stream link must always have the fixed six-part purple Twitch + `СТРИМ` custom-emoji sequence immediately to its left.
+- For each `kick.com` stream link, randomly choose one of three source groups with equal source-level probability: the complete six-part green Kick wordmark from `FJKSTREAM`; one random K emoji from the three approved `Emoji slots` IDs; or one random emoji from the approved `Kick Emojis @liltenref` pack IDs. Never use an emoji outside these approved Kick sources as the link marker.
+- Platform link markers are mandatory and deterministic. Random premium/custom emoji may still decorate other eligible positions in the post, but must not replace, split, or precede the platform marker at the URL position.
 - The autoposter should load premium/custom emoji from all account emoji packs and choose each inserted emoji randomly from that full pool.
 - Do not add ordinary Unicode emoji as a separate random decoration. Normal emoji characters may only appear as the required alt text behind `MessageEntityCustomEmoji`; the visible decoration should be Telegram premium/custom emoji.
 - If a future change makes the log show only a tiny candidate count such as `40`, inspect `load_premium_emojis`; that usually means it fell back to seed search instead of account packs.

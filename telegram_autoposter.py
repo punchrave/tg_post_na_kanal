@@ -40,6 +40,99 @@ DEFAULT_PREMIUM_EMOJI_SEEDS = (
     "\U0001f680",
     "\u2728",
 )
+PLATFORM_PREMIUM_EMOJI_IDS: dict[str, tuple[int, ...]] = {
+    # FJK / FJKSTREAM: Twitch logo followed by the five-part "СТРИМ" wordmark.
+    "twitch.tv": (
+        5375165697091444421,
+        5373014068800004410,
+        5375324447672639223,
+        5375478456609938467,
+        5375543628443688994,
+        5375242469631860392,
+    ),
+    # FJK / FJKSTREAM: six-part green Kick wordmark, parallel to the Twitch marker.
+    "kick.com": (
+        5406873237319604574,
+        5408994190954615883,
+        5406602624315184325,
+        5409155424026908490,
+        5406828410745935669,
+        5408871896055831384,
+    ),
+}
+KICK_EMOJI_SLOTS_IDS: tuple[int, ...] = (
+    5379839914294671718,
+    5379598751880987087,
+    5379609253076029765,
+)
+KICK_RANDOM_PACK_IDS: tuple[int, ...] = (
+    5361773817263850423,
+    5363880941104172160,
+    5364259241823601068,
+    5364235894381381884,
+    5361677708780668586,
+    5364080622723696466,
+    5361560473353355676,
+    5363938510845805942,
+    5364224048861578029,
+    5361911664239216323,
+    5363984604434824035,
+    5361890391266197026,
+    5361598574008241838,
+    5363967785342897297,
+    5361675814700093572,
+    5361933710306346756,
+    5363868305310385142,
+    5364276374448145656,
+    5363870594527952988,
+    5364206186092594001,
+    5362084957579676783,
+    5363858671698738728,
+    5361587445747974981,
+    5361726624163202134,
+    5362053325145539327,
+    5364034486185002811,
+    5364349479086489639,
+    5361575668947651510,
+    5364148581991221889,
+    5363925866462087865,
+    5361887066961512847,
+    5363854501285494345,
+    5361813940848333708,
+    5363871217298211603,
+    5364156604990130229,
+    5361648142225803334,
+    5364205425883386262,
+    5364339776755365514,
+    5361901536706330924,
+    5363955673535120751,
+    5364283040237389964,
+    5362078738467030165,
+    5362030845286712934,
+    5363991034000868255,
+    5361820297399928432,
+    5364227231432343942,
+    5364078101577893615,
+    5364006805120777578,
+    5364295057555882899,
+    5364179982497119584,
+    5363979424704268270,
+    5362091911131726671,
+    5363866454179480916,
+    5361682239971166958,
+    5361722599778846120,
+    5364203828155548179,
+    5364136792305994891,
+    5364061007608054814,
+    5361787810267299692,
+    5361592049952915269,
+    5364076542504765476,
+    5364234726150276984,
+    5364243011142190679,
+    5233719487592699278,
+    5215189272100900142,
+    5217914811102301697,
+)
 MEDIA_DIRECTIVE_RE = re.compile(
     r"^\s*(?:КАРТИНКА|ФОТО|IMAGE|PHOTO|MEDIA)\s*:\s*(.+?)\s*$",
     re.IGNORECASE,
@@ -596,14 +689,14 @@ def parse_args() -> argparse.Namespace:
         "--no-icheatbot",
         dest="no_icheatbot",
         action="store_true",
-        default=True,
-        help="Do not send automatic icheatbot API orders (current default).",
+        default=False,
+        help="Disable automatic icheatbot API orders for this run.",
     )
     parser.add_argument(
         "--icheatbot",
         dest="no_icheatbot",
         action="store_false",
-        help="Explicitly enable automatic icheatbot API orders for this run.",
+        help="Explicitly enable automatic icheatbot API orders (current default).",
     )
     return parser.parse_args()
 
@@ -1518,6 +1611,27 @@ async def premium_emoji_from_document_ids(
     ]
 
 
+async def include_platform_premium_emojis(
+    client: TelegramClient,
+    emojis: Sequence[PremiumEmoji],
+) -> list[PremiumEmoji]:
+    existing_ids = {emoji.document_id for emoji in emojis}
+    required_ids = [
+        document_id
+        for document_ids in (
+            *PLATFORM_PREMIUM_EMOJI_IDS.values(),
+            KICK_EMOJI_SLOTS_IDS,
+            KICK_RANDOM_PACK_IDS,
+        )
+        for document_id in document_ids
+        if document_id not in existing_ids
+    ]
+    if not required_ids:
+        return unique_premium_emojis(emojis)
+    required = await premium_emoji_from_document_ids(client, required_ids)
+    return unique_premium_emojis([*emojis, *required])
+
+
 async def premium_emojis_from_pack(
     client: TelegramClient,
     short_name: str,
@@ -1592,7 +1706,8 @@ async def premium_emojis_from_account_packs(client: TelegramClient) -> list[Prem
 async def load_premium_emojis(client: TelegramClient) -> list[PremiumEmoji]:
     env_ids = clean_int_list(os.getenv("TG_PREMIUM_EMOJI_IDS", ""))
     if env_ids:
-        return await premium_emoji_from_document_ids(client, env_ids)
+        configured = await premium_emoji_from_document_ids(client, env_ids)
+        return await include_platform_premium_emojis(client, configured)
 
     pack_names = [
         item.strip()
@@ -1605,7 +1720,7 @@ async def load_premium_emojis(client: TelegramClient) -> list[PremiumEmoji]:
             pack_emojis.append(emoji)
     pack_emojis = unique_premium_emojis(pack_emojis)
     if pack_emojis:
-        return pack_emojis
+        return await include_platform_premium_emojis(client, pack_emojis)
 
     seen: set[int] = set()
     document_ids: list[int] = []
@@ -1636,7 +1751,8 @@ async def load_premium_emojis(client: TelegramClient) -> list[PremiumEmoji]:
         if len(document_ids) >= search_limit:
             break
 
-    return await premium_emoji_from_document_ids(client, document_ids)
+    searched = await premium_emoji_from_document_ids(client, document_ids)
+    return await include_platform_premium_emojis(client, searched)
 
 
 def first_non_empty_line_start(message: str) -> int | None:
@@ -1685,9 +1801,6 @@ def premium_accent_plans(
         candidates.append((index, before, after))
         used_indexes.add(index)
 
-    for match in CHANNEL_URL_RE.finditer(message):
-        add_candidate(match.start(), "", " ")
-
     first_start = first_non_empty_line_start(message)
     if first_start is not None and CHANNEL_URL_RE.match(message, first_start) is None:
         add_candidate(first_start, "", " ")
@@ -1708,6 +1821,34 @@ def premium_accent_plans(
         (index, random.choice(premium_emojis), before, after)
         for index, before, after in candidates[:count]
     ]
+
+
+def platform_premium_emoji_plans(
+    message: str,
+    premium_emojis: Sequence[PremiumEmoji],
+) -> list[tuple[int, tuple[PremiumEmoji, ...]]]:
+    emoji_by_id = {emoji.document_id: emoji for emoji in premium_emojis}
+    plans: list[tuple[int, tuple[PremiumEmoji, ...]]] = []
+    for match in CHANNEL_URL_RE.finditer(message):
+        domain = match.group("domain").casefold()
+        if domain == "kick.com":
+            source = random.choice(("wordmark", "slots", "pack"))
+            if source == "slots":
+                document_ids = (random.choice(KICK_EMOJI_SLOTS_IDS),)
+            elif source == "pack":
+                document_ids = (random.choice(KICK_RANDOM_PACK_IDS),)
+            else:
+                document_ids = PLATFORM_PREMIUM_EMOJI_IDS["kick.com"]
+        else:
+            document_ids = PLATFORM_PREMIUM_EMOJI_IDS.get(domain, ())
+        sequence = tuple(
+            emoji_by_id[document_id]
+            for document_id in document_ids
+            if document_id in emoji_by_id
+        )
+        if sequence and len(sequence) == len(document_ids):
+            plans.append((match.start(), sequence))
+    return plans
 
 
 async def decorate_with_premium_emojis(
@@ -1748,6 +1889,23 @@ async def decorate_with_premium_emojis(
             before=before,
             after=after,
         )
+
+    platform_plans = platform_premium_emoji_plans(message, premium_emojis)
+    for index, emoji_sequence in sorted(
+        platform_plans,
+        key=lambda item: item[0],
+        reverse=True,
+    ):
+        for reverse_index, emoji in enumerate(reversed(emoji_sequence)):
+            message = insert_premium_emoji(
+                message,
+                entities,
+                custom_entities,
+                index,
+                emoji,
+                before="",
+                after=" " if reverse_index == 0 else "",
+            )
 
     all_entities = entities + custom_entities
     all_entities.sort(key=lambda entity: getattr(entity, "offset", 0))
