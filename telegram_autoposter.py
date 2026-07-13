@@ -890,11 +890,21 @@ def list_media_pool_files(path: Path) -> list[Path]:
 
 def load_media_rotation_state(path: Path) -> dict[str, object]:
     if not path.exists():
-        return {"cycle": 1, "used_channels": []}
+        return {
+            "cycle": 1,
+            "used_channels": [],
+            "known_channels": [],
+            "channel_image_counts": {},
+        }
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError:
-        return {"cycle": 1, "used_channels": []}
+        return {
+            "cycle": 1,
+            "used_channels": [],
+            "known_channels": [],
+            "channel_image_counts": {},
+        }
 
     cycle = raw.get("cycle", 1)
     used_channels = raw.get("used_channels", [])
@@ -903,11 +913,43 @@ def load_media_rotation_state(path: Path) -> dict[str, object]:
     if not isinstance(used_channels, list):
         used_channels = []
 
+    clean_used_channels = [
+        item.casefold()
+        for item in used_channels
+        if isinstance(item, str) and item
+    ]
+    raw_counts = raw.get("channel_image_counts", {})
+    channel_image_counts = (
+        {
+            key.casefold(): value
+            for key, value in raw_counts.items()
+            if isinstance(key, str)
+            and key
+            and isinstance(value, int)
+            and value >= 0
+        }
+        if isinstance(raw_counts, dict)
+        else {}
+    )
+    # Migrate the original cycle/used-list format without losing its history.
+    if not channel_image_counts:
+        channel_image_counts = {key: cycle for key in clean_used_channels}
+
+    raw_known_channels = raw.get("known_channels", [])
+    known_channels = [
+        item.casefold()
+        for item in raw_known_channels
+        if isinstance(item, str) and item
+    ] if isinstance(raw_known_channels, list) else []
+    known_channels = list(
+        dict.fromkeys([*known_channels, *channel_image_counts, *clean_used_channels])
+    )
+
     return {
         "cycle": cycle,
-        "used_channels": [
-            item for item in used_channels if isinstance(item, str) and item
-        ],
+        "used_channels": clean_used_channels,
+        "known_channels": known_channels,
+        "channel_image_counts": channel_image_counts,
     }
 
 
@@ -923,28 +965,34 @@ def auto_media_assignments(
     targets: list[Target],
     media_files: Sequence[Path],
     state: dict[str, object],
+    rotation_universe: Sequence[Target] | None = None,
 ) -> dict[str, Path]:
     if not targets or not media_files:
         return {}
 
-    target_keys = [target_rotation_key(target) for target in targets]
-    all_target_keys = set(target_keys)
-    used_channels = {
+    universe = rotation_universe or targets
+    known_channels = [
         item
-        for item in state.get("used_channels", [])
-        if isinstance(item, str) and item in all_target_keys
-    }
-    if used_channels >= all_target_keys:
-        state["cycle"] = int(state.get("cycle", 1)) + 1
-        used_channels = set()
-        state["used_channels"] = []
-
-    available_targets = [
-        target
-        for target in targets
-        if target_rotation_key(target) not in used_channels
+        for item in state.get("known_channels", [])
+        if isinstance(item, str) and item
     ]
+    known_channels = list(
+        dict.fromkeys(
+            [*known_channels, *(target_rotation_key(target) for target in universe)]
+        )
+    )
+    state["known_channels"] = known_channels
+
+    raw_counts = state.get("channel_image_counts", {})
+    counts = raw_counts if isinstance(raw_counts, dict) else {}
+
+    # A shuffled stable sort randomizes ties while always preferring channels
+    # that have received fewer ordinary images across every previous subset run.
+    available_targets = list(targets)
     random.shuffle(available_targets)
+    available_targets.sort(
+        key=lambda target: int(counts.get(target_rotation_key(target), 0))
+    )
 
     shuffled_media = list(media_files)
     random.shuffle(shuffled_media)
@@ -964,15 +1012,29 @@ def mark_auto_media_used(
     state: dict[str, object],
     channel_keys: Iterable[str],
 ) -> None:
-    used_channels = [
-        item for item in state.get("used_channels", []) if isinstance(item, str)
+    raw_counts = state.get("channel_image_counts", {})
+    counts = dict(raw_counts) if isinstance(raw_counts, dict) else {}
+    known_channels = [
+        item
+        for item in state.get("known_channels", [])
+        if isinstance(item, str) and item
     ]
-    used_set = set(used_channels)
     for key in channel_keys:
-        if key not in used_set:
-            used_channels.append(key)
-            used_set.add(key)
-    state["used_channels"] = used_channels
+        normalized_key = key.casefold()
+        counts[normalized_key] = int(counts.get(normalized_key, 0)) + 1
+        if normalized_key not in known_channels:
+            known_channels.append(normalized_key)
+
+    minimum_count = min(
+        (int(counts.get(key, 0)) for key in known_channels),
+        default=0,
+    )
+    state["cycle"] = minimum_count + 1
+    state["used_channels"] = [
+        key for key in known_channels if int(counts.get(key, 0)) > minimum_count
+    ]
+    state["known_channels"] = known_channels
+    state["channel_image_counts"] = counts
     save_media_rotation_state(path, state)
 
 
@@ -2290,6 +2352,15 @@ async def amain() -> None:
             targets = targets[: args.limit]
         if not targets:
             raise SystemExit("No matching channel targets found.")
+
+        rotation_universe_targets = targets
+        rotation_folder = folder or os.getenv("TG_FOLDER")
+        if args.channels_file and not folder and rotation_folder:
+            rotation_universe_targets = await folder_targets(
+                client,
+                rotation_folder,
+                args.include_groups,
+            )
         skipped_targets = [target for target in targets if target_should_skip_post(target)]
         post_targets = [target for target in targets if not target_should_skip_post(target)]
 
@@ -2361,6 +2432,7 @@ async def amain() -> None:
             media_targets,
             media_files,
             media_rotation_state,
+            rotation_universe_targets,
         )
         all_prepared_posts = prepare_posts(
             targets,

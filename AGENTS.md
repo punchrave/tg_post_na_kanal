@@ -79,11 +79,11 @@ post text
 ## Preparing Images
 
 - Copy attached images into `media_pool` with clear dated names such as `YYYYMMDD_01.png`, `YYYYMMDD_02.png`, etc. Copy them; do not move or delete the original temp files.
-- For a new user-provided image batch, use a fresh media rotation state file so old rotation state does not limit the number of attached images:
+- Keep the shared `media_rotation_state.json` for every image batch, including runs that use a subset channels file. It tracks the number of ordinary images actually posted to each channel across the full Telegram folder, so channels with fewer past images are selected first and an omitted channel keeps its priority until it returns.
 
 ```powershell
-python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run --skip-posted-today --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
-python .\telegram_autoposter.py --messages-file .\posts.txt --skip-posted-today --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
+python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run --skip-posted-today --media-rotation-state .\media_rotation_state.json
+python .\telegram_autoposter.py --messages-file .\posts.txt --skip-posted-today --media-rotation-state .\media_rotation_state.json
 ```
 
 - The real posting run archives used images from `media_pool` into `media_used\YYYYMMDD_HHMMSS`. Verify the archive count and that `media_pool` is empty when all provided images were consumed.

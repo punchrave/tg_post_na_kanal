@@ -76,11 +76,11 @@ python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run
 python .\telegram_autoposter.py --messages-file .\posts.txt
 ```
 
-When a fresh batch of images is provided, copy them to `media_pool` and use a fresh rotation state so the whole new batch can be attached instead of being limited by an old rotation cycle:
+When a fresh batch of images is provided, copy it to `media_pool` and keep the shared rotation state. The state balances ordinary images by each channel's successful historical count, including when a run targets only part of the Telegram folder:
 
 ```powershell
-python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
-python .\telegram_autoposter.py --messages-file .\posts.txt --media-rotation-state .\media_rotation_state_YYYYMMDD_posts.json
+python .\telegram_autoposter.py --messages-file .\posts.txt --dry-run --media-rotation-state .\media_rotation_state.json
+python .\telegram_autoposter.py --messages-file .\posts.txt --media-rotation-state .\media_rotation_state.json
 ```
 
 After posting, copy-friendly lines are written to `reports/copy_YYYYMMDD_HHMMSS.txt`; these are the lines to send back to the user.

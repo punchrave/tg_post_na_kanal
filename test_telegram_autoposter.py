@@ -19,9 +19,12 @@ from telegram_autoposter import (
     SequencedPayload,
     Target,
     batch_channel_records,
+    auto_media_assignments,
     build_scheduled_posts,
+    load_media_rotation_state,
     load_owned_posts_state,
     list_media_pool_files,
+    mark_auto_media_used,
     platform_premium_emoji_plans,
     premium_accent_plans,
     prepare_posts,
@@ -146,6 +149,45 @@ class MultiPostParserTests(unittest.TestCase):
                 {},
                 {"channel": Path("ordinary.png")},
             )
+
+
+class MediaRotationTests(unittest.TestCase):
+    def target(self, username: str) -> Target:
+        return Target(username, SimpleNamespace(username=username))
+
+    def test_missing_subset_channel_keeps_priority_until_it_returns(self) -> None:
+        state = {
+            "cycle": 1,
+            "used_channels": ["one", "two"],
+            "known_channels": ["one", "two", "three"],
+            "channel_image_counts": {"one": 2, "two": 1, "three": 0},
+        }
+        targets = [self.target("one"), self.target("three")]
+
+        assignments = auto_media_assignments(
+            targets,
+            [Path("ordinary.png")],
+            state,
+            [self.target("one"), self.target("two"), self.target("three")],
+        )
+
+        self.assertEqual(list(assignments), ["three"])
+
+    def test_successful_images_increment_per_channel_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "rotation.json"
+            state = {
+                "cycle": 1,
+                "used_channels": [],
+                "known_channels": ["one", "two"],
+                "channel_image_counts": {"one": 0, "two": 0},
+            }
+            mark_auto_media_used(path, state, ["one"])
+            reloaded = load_media_rotation_state(path)
+
+        self.assertEqual(reloaded["channel_image_counts"], {"one": 1, "two": 0})
+        self.assertEqual(reloaded["used_channels"], ["one"])
+        self.assertEqual(reloaded["cycle"], 1)
 
 
 class SchedulingAndOwnershipTests(unittest.TestCase):
